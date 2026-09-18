@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# tunnel.sh - expose workspace-mcp to ChatGPT chat via OpenAI Secure MCP Tunnel.
+#
+# Prompts for your OpenAI API key (hidden input) and, when needed, your
+# tunnel_id from:
+#   https://platform.openai.com/settings/organization/tunnels
+#
+# The key can be saved once to ~/.config/tunnel-client/api-key (chmod 600);
+# after that this script never asks for it again.
+#
+# Usage: scripts/tunnel.sh [--root PATH] [--workspace NAME=PATH] [--name NAME] [--ui-port N] [--reinit] [--shell|--shell-any]
+#   --root PATH       Primary workspace root (required unless --workspace is given)
+#   --workspace N=P   Extra named workspace served by the SAME server (repeatable).
+#                     If --root is omitted, the first --workspace becomes the primary.
+#                     Example: --workspace api=/path/to/other-project
+#   --name NAME       Optional second daemon profile (workspace-mcp-NAME, own UI port).
+#                     Not needed for multiple workspaces - use --workspace instead.
+#   --ui-port N       Local status UI port (default: 8080 without --name, auto-picked otherwise)
+#   --reinit          Recreate the tunnel-client profile even if it already exists
+#   --shell           Enable run_command in allowlist mode (WORKSPACE_MCP_SHELL=1)
+#   --shell-any       Enable run_command unrestricted (WORKSPACE_MCP_SHELL_MODE=any)
+#
+# Env overrides: WORKSPACE_MCP_NODE (absolute path to node; defaults to the one
+# in PATH) and WORKSPACE_MCP_SERVER (absolute path to dist/index.js; defaults to
+# ../dist/index.js relative to this script).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+NODE="${WORKSPACE_MCP_NODE:-$(command -v node || true)}"
+SERVER="${WORKSPACE_MCP_SERVER:-$SCRIPT_DIR/../dist/index.js}"
+KEY_FILE="$HOME/.config/tunnel-client/api-key"
+
+usage() {
+  cat <<'EOF'
+Usage: tunnel.sh [--root PATH] [--workspace NAME=PATH] [--name NAME] [--ui-port N] [--reinit] [--shell|--shell-any]
+
+  --root PATH       Primary workspace root (required unless --workspace is given)
+  --workspace N=P   Extra named workspace served by the SAME server (repeatable).
+                    If --root is omitted, the first --workspace becomes the primary.
+                    Each workspace keeps its own journal/changes state.
+  --name NAME       Optional second daemon profile (workspace-mcp-NAME, own UI port).
+                    Not needed for multiple workspaces - use --workspace instead.
+  --ui-port N       Local status UI port (default 8080; auto-picked per --name)
+  --reinit          Recreate the tunnel-client profile even if it already exists
+  --shell           Enable run_command in allowlist mode (exports WORKSPACE_MCP_SHELL=1)
+  --shell-any       Enable run_command in unrestricted mode (any executable; exports
+                    WORKSPACE_MCP_SHELL=1 and WORKSPACE_MCP_SHELL_MODE=any)
+
+Asks for your OpenAI API key the first time and offers to save it to
+~/.config/tunnel-client/api-key (chmod 600). Delete that file to be asked
+again. On first run it also asks for your tunnel_id.
+
+node is resolved from PATH; set WORKSPACE_MCP_NODE to override it. The server
+bundle defaults to ../dist/index.js relative to this script; set
+WORKSPACE_MCP_SERVER to override it.
+EOF
+}
+
+ROOT=""
+ROOT_EXPLICIT=0
+WORKSPACES=()
+NAME=""
+UI_PORT=""
+REINIT=0
+SHELL_MODE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root)
+      [[ $# -ge 2 ]] || { echo "ERROR: --root needs a value" >&2; exit 2; }
+      ROOT="$2"; ROOT_EXPLICIT=1; shift 2 ;;
+    --workspace)
+      [[ $# -ge 2 ]] || { echo "ERROR: --workspace needs a value (<name>=<path>)" >&2; exit 2; }
+      WORKSPACES+=("$2"); shift 2 ;;
+    --name)
+      [[ $# -ge 2 ]] || { echo "ERROR: --name needs a value" >&2; exit 2; }
+      NAME="$2"; shift 2 ;;
+    --ui-port)
+      [[ $# -ge 2 ]] || { echo "ERROR: --ui-port needs a value" >&2; exit 2; }
+      UI_PORT="$2"; shift 2 ;;
+    --reinit) REINIT=1; shift ;;
+    --shell) SHELL_MODE="allowlist"; shift ;;
+    --shell-any) SHELL_MODE="any"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ERROR: unknown option '$1' (use --help)" >&2; exit 2 ;;
+  esac
+done
+
+# Workspace validation (name=path, lowercase name, no spaces).
+for w in "${WORKSPACES[@]}"; do
+  if [[ ! "$w" =~ ^[a-z0-9][a-z0-9_-]*= ]]; then
+    echo "ERROR: --workspace must be <name>=<path> with a lowercase name (e.g. api=/path/to/repo): $w" >&2
+    exit 2
+  fi
+  if [[ "$w" == *[[:space:]]* ]]; then
+    echo "ERROR: --workspace values must not contain spaces: $w" >&2
+    exit 2
+  fi
+done
+
+if [[ $ROOT_EXPLICIT -eq 0 && ${#WORKSPACES[@]} -gt 0 ]]; then
+  ROOT=""            # server: the first --workspace becomes the primary
+elif [[ $ROOT_EXPLICIT -eq 0 ]]; then
+  echo "ERROR: pass --root <path> or --workspace <name>=<path>" >&2
+  exit 2
+fi
+
+# Exact mcp-command for this configuration (also used to detect profile drift).
+MCP_CMD="$NODE $SERVER"
+if [[ -n "$ROOT" ]]; then
+  MCP_CMD+=" --root $ROOT"
+fi
+for w in "${WORKSPACES[@]}"; do
+  MCP_CMD+=" --workspace $w"
+done
+
+if [[ -n "$NAME" && ! "$NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+  echo "ERROR: --name must be lowercase letters, numbers and dashes (e.g. dev)" >&2
+  exit 2
+fi
+if [[ -n "$UI_PORT" && ! "$UI_PORT" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --ui-port must be a number" >&2; exit 2
+fi
+if [[ -n "$UI_PORT" ]] && (( UI_PORT < 1024 || UI_PORT > 65535 )); then
+  echo "ERROR: --ui-port must be between 1024 and 65535" >&2; exit 2
+fi
+
+PROFILE="workspace-mcp"
+if [[ -n "$NAME" ]]; then
+  PROFILE="workspace-mcp-$NAME"
+fi
+PROFILE_FILE="$HOME/.config/tunnel-client/${PROFILE}.yaml"
+
+# Stable per-profile UI port: 8081-8179 derived from the name, bumped while busy.
+find_free_port() {
+  local port="$1" i=0
+  if ! command -v ss >/dev/null 2>&1; then
+    printf '%s' "$port"; return 0
+  fi
+  while [[ $i -lt 100 && -n "$(ss -tlnH "sport = :$port" 2>/dev/null)" ]]; do
+    port=$((port + 1)); i=$((i + 1))
+  done
+  printf '%s' "$port"
+}
+if [[ -z "$UI_PORT" ]]; then
+  if [[ -z "$NAME" ]]; then
+    UI_PORT=8080
+  else
+    UI_PORT=$(( 8081 + $(printf '%s' "$NAME" | cksum | cut -d' ' -f1) % 99 ))
+  fi
+fi
+UI_PORT="$(find_free_port "$UI_PORT")"
+
+# --- sanity checks -----------------------------------------------------------
+command -v tunnel-client >/dev/null 2>&1 || {
+  echo "ERROR: tunnel-client not found in PATH" >&2; exit 1; }
+if [[ -z "$NODE" || ! -x "$NODE" ]]; then
+  echo "ERROR: node not found in PATH; set WORKSPACE_MCP_NODE to an absolute path" >&2
+  exit 1
+fi
+[[ -f "$SERVER" ]] || {
+  echo "ERROR: $SERVER is missing. Run 'pnpm build' in the repository root first." >&2
+  exit 1; }
+if [[ -n "$ROOT" ]]; then
+  [[ -d "$ROOT" ]] || { echo "ERROR: workspace root does not exist: $ROOT" >&2; exit 1; }
+fi
+for w in "${WORKSPACES[@]}"; do
+  ws_path="${w#*=}"
+  [[ -d "$ws_path" ]] || { echo "ERROR: workspace path does not exist: $ws_path" >&2; exit 1; }
+done
+
+# --- 1. API key: env var -> saved file -> prompt (+ optional save) -----------
+if [[ -z "${CONTROL_PLANE_API_KEY:-}" && -f "$KEY_FILE" ]]; then
+  CONTROL_PLANE_API_KEY="$(< "$KEY_FILE")"
+fi
+if [[ -z "${CONTROL_PLANE_API_KEY:-}" ]]; then
+  read -rsp "Paste your OpenAI API key (hidden): " CONTROL_PLANE_API_KEY || true
+  echo
+  SAVE_KEY=""
+  read -rp "Save it to $KEY_FILE (chmod 600) for next runs? [y/N] " SAVE_KEY || true
+  if [[ "$SAVE_KEY" =~ ^[Yy] ]]; then
+    umask 077
+    mkdir -p "$(dirname "$KEY_FILE")"
+    printf '%s\n' "$CONTROL_PLANE_API_KEY" > "$KEY_FILE"
+    echo "Saved: $KEY_FILE (delete it anytime to be asked again)"
+  fi
+fi
+[[ -n "${CONTROL_PLANE_API_KEY:-}" ]] || { echo "ERROR: empty API key" >&2; exit 1; }
+export CONTROL_PLANE_API_KEY
+
+# --- 2. tunnel-client profile ------------------------------------------------
+CURRENT_CMD=""
+if [[ -f "$PROFILE_FILE" ]]; then
+  CURRENT_CMD="$(sed -n 's/^[[:space:]]*command:[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$PROFILE_FILE" | head -n1)"
+fi
+if [[ -f "$PROFILE_FILE" && $REINIT -eq 0 && -n "$CURRENT_CMD" && "$CURRENT_CMD" == "$MCP_CMD" ]]; then
+  echo "Profile '$PROFILE' already exists and matches this configuration."
+else
+  TUNNEL_ID=""
+  if [[ -f "$PROFILE_FILE" ]]; then
+    TUNNEL_ID="$(sed -n 's/.*tunnel_id:[[:space:]]*"\([^"]*\)".*/\1/p' "$PROFILE_FILE" | head -n1)"
+  fi
+  if [[ -z "$TUNNEL_ID" ]]; then
+    read -rp "Paste your tunnel_id (tunnel_...): " TUNNEL_ID || true
+  else
+    echo "Reusing tunnel_id from existing profile: $TUNNEL_ID"
+  fi
+  [[ -n "$TUNNEL_ID" ]] || { echo "ERROR: empty tunnel_id" >&2; exit 1; }
+
+  rm -f "$PROFILE_FILE"
+  echo "Creating tunnel-client profile '$PROFILE'"
+  tunnel-client init --sample sample_mcp_stdio_local --profile "$PROFILE" \
+    --tunnel-id "$TUNNEL_ID" \
+    --mcp-command "$MCP_CMD"
+fi
+
+# Keep the profile's health listener in sync with the chosen UI port so doctor
+# and run agree (required to run several daemons side by side).
+sed -i -E "s/^([[:space:]]*listen_addr:[[:space:]]*)\"[^\"]*\"/\1\"127.0.0.1:${UI_PORT}\"/" "$PROFILE_FILE"
+
+# --- 3. validate and run -----------------------------------------------------
+tunnel-client doctor --profile "$PROFILE" --explain
+
+# --- 4. optional run_command ---------------------------------------------
+# Exported here so the daemon (and the stdio server it launches) inherit them.
+if [[ "$SHELL_MODE" == "any" ]]; then
+  export WORKSPACE_MCP_SHELL=1
+  export WORKSPACE_MCP_SHELL_MODE=any
+  echo "WARNING: run_command enabled in UNRESTRICTED mode (--shell-any): any executable can run with your OS user's permissions." >&2
+elif [[ "$SHELL_MODE" == "allowlist" ]]; then
+  export WORKSPACE_MCP_SHELL=1
+  echo "run_command enabled in allowlist mode (default allowlist; extend with WORKSPACE_MCP_SHELL_ALLOW)."
+fi
+
+echo
+echo "Starting tunnel daemon [$PROFILE]"
+if [[ -n "$ROOT" ]]; then
+  echo "  primary root: $ROOT"
+fi
+for w in "${WORKSPACES[@]}"; do
+  echo "  workspace: $w"
+done
+echo "Local status UI: http://127.0.0.1:$UI_PORT/ui   (Ctrl+C to stop)"
+exec tunnel-client run --profile "$PROFILE" --health.listen-addr "127.0.0.1:$UI_PORT"
