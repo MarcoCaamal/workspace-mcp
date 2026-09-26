@@ -42,6 +42,7 @@ export function registerRunTool(server: McpServer, registry: WorkspaceRegistry, 
         "No TTY is attached, so interactive and watch commands are not supported and will run until the timeout. " +
         `${modeDescription} ` +
         "Output is stripped of ANSI escape codes and truncated in the middle when it exceeds 256 KiB. " +
+        "Child processes inherit a scrubbed environment: secret-bearing variables (CONTROL_PLANE_API_KEY, OPENAI_API_KEY, OPENAI_ADMIN_KEY, MCP_TOKEN) are removed before spawn. " +
         `Defaults: cwd is the workspace root and timeoutMs is ${defaultTimeoutMs} (max ${MAX_TIMEOUT_MS}); a timeout kills the whole process group.`,
       inputSchema: {
         command: z

@@ -57,12 +57,32 @@ export interface StateFileSettings {
   journalMaxBytes?: number;
 }
 
+/** ChatGPT guided-entry settings read from the config file (all optional). */
+export interface ChatgptFileSettings {
+  /** `false` disables the guided first-run preset; explicit selection still works. */
+  preset?: boolean;
+  /** Workspace name the guided entry binds to; must name a configured workspace. */
+  primary?: string;
+}
+
+/** Harness session-store settings read from the config file (all optional). */
+export interface HarnessFileSettings {
+  /** `true` registers the session/work/stage tools backed by the outside-repo store. */
+  session?: boolean;
+  /** `true` enables the scoped recall extension (Slice 3); inert until recall ships. */
+  recall?: boolean;
+  /** Explicit database file path; `WORKSPACE_MCP_HARNESS_DB` wins when set. */
+  dbPath?: string;
+}
+
 /** Validated config file contents. Workspace paths are absolute and real. */
 export interface ConfigFileData {
   workspaces: WorkspaceConfig[];
   shell: ShellFileSettings;
   transport: TransportFileSettings;
   state: StateFileSettings;
+  chatgpt: ChatgptFileSettings;
+  harness: HarnessFileSettings;
 }
 
 /** A config file that was read from disk. */
@@ -81,6 +101,18 @@ export interface ResolvedConfig {
   shell: ShellConfig;
   transport: { http: boolean; host: string; port: number };
   state: { journalMaxBytes: number | undefined };
+  /**
+   * Guided ChatGPT entry binding. `preset` is true unless the file disables
+   * it; `primary` is the bound workspace name, or undefined when the preset
+   * is off (explicit workspace selection keeps working).
+   */
+  chatgpt: { preset: boolean; primary: string | undefined };
+  /**
+   * Harness session-store binding. Both flags default off; `dbPath` is the
+   * explicit config/env override or the global `harness.db` default, so it
+   * is always an absolute path.
+   */
+  harness: { session: boolean; recall: boolean; dbPath: string };
   /** Absolute path of the config file in use, when any. */
   configPath: string | undefined;
 }
@@ -97,10 +129,12 @@ export interface MergeConfigInput {
   transport: { http: boolean; host: string | undefined; port: number | undefined };
 }
 
-const TOP_LEVEL_KEYS: readonly string[] = ["$schema", "workspaces", "shell", "transport", "state"];
+const TOP_LEVEL_KEYS: readonly string[] = ["$schema", "workspaces", "shell", "transport", "state", "chatgpt", "harness"];
 const SHELL_KEYS: readonly string[] = ["mode", "allow", "deny", "timeoutMs", "maxRuntimeMs"];
 const TRANSPORT_KEYS: readonly string[] = ["type", "host", "port"];
 const STATE_KEYS: readonly string[] = ["journalMaxBytes"];
+const CHATGPT_KEYS: readonly string[] = ["preset", "primary"];
+const HARNESS_KEYS: readonly string[] = ["session", "recall", "dbPath"];
 const SHELL_MODES: readonly string[] = ["allowlist", "any"];
 
 /** Reads and validates a config file. Throws {@link ConfigError} when unusable. */
@@ -185,6 +219,8 @@ export function validateConfig(raw: unknown, baseDir: string = process.cwd()): C
     shell: parseShell(raw.shell),
     transport: parseTransport(raw.transport),
     state: parseState(raw.state),
+    chatgpt: parseChatgpt(raw.chatgpt),
+    harness: parseHarness(raw.harness),
   };
 }
 
@@ -207,6 +243,8 @@ export function mergeConfig(input: MergeConfigInput): ResolvedConfig {
     shell: resolveShellConfig(input.file?.shell ?? {}, input.shell, input.env),
     transport: resolveTransportConfig(input.file?.transport ?? {}, input.transport),
     state: { journalMaxBytes: input.file?.state.journalMaxBytes },
+    chatgpt: resolveChatgptEntry(input.file?.chatgpt, workspaces, defaultWorkspace),
+    harness: resolveHarnessConfig(input.file?.harness, input.env),
     configPath: input.file?.path,
   };
 }
@@ -462,6 +500,130 @@ function parseState(value: unknown): StateFileSettings {
   return state;
 }
 
+function parseHarness(value: unknown): HarnessFileSettings {
+  if (value === undefined) {
+    return {};
+  }
+  if (!isPlainObject(value)) {
+    throw new ConfigError('config key "harness" must be an object');
+  }
+  const harness: HarnessFileSettings = {};
+  if (value.session !== undefined) {
+    if (typeof value.session !== "boolean") {
+      throw new ConfigError(`invalid harness.session: ${JSON.stringify(value.session)} (expected a boolean)`);
+    }
+    harness.session = value.session;
+  }
+  if (value.recall !== undefined) {
+    if (typeof value.recall !== "boolean") {
+      throw new ConfigError(`invalid harness.recall: ${JSON.stringify(value.recall)} (expected a boolean)`);
+    }
+    harness.recall = value.recall;
+  }
+  if (value.dbPath !== undefined) {
+    if (typeof value.dbPath !== "string" || value.dbPath.trim() === "") {
+      throw new ConfigError(`invalid harness.dbPath: ${JSON.stringify(value.dbPath)} (expected a non-empty path)`);
+    }
+    harness.dbPath = value.dbPath;
+  }
+  return harness;
+}
+
+function parseChatgpt(value: unknown): ChatgptFileSettings {
+  if (value === undefined) {
+    return {};
+  }
+  if (!isPlainObject(value)) {
+    throw new ConfigError('config key "chatgpt" must be an object');
+  }
+  const chatgpt: ChatgptFileSettings = {};
+  if (value.preset !== undefined) {
+    if (typeof value.preset !== "boolean") {
+      throw new ConfigError(`invalid chatgpt.preset: ${JSON.stringify(value.preset)} (expected a boolean)`);
+    }
+    chatgpt.preset = value.preset;
+  }
+  if (value.primary !== undefined) {
+    if (typeof value.primary !== "string" || value.primary.trim() === "") {
+      throw new ConfigError(`invalid chatgpt.primary: ${JSON.stringify(value.primary)} (expected a workspace name)`);
+    }
+    chatgpt.primary = value.primary;
+  }
+  return chatgpt;
+}
+
+/**
+ * Guided-entry precedence: config file > built-in defaults (preset on,
+ * primary falls back to the default workspace). A configured primary MUST
+ * name a workspace from the final merged list (file + CLI); anything else is
+ * a startup error that names the value instead of guessing. Disabling the
+ * preset leaves multi-workspace selection untouched.
+ */
+function resolveChatgptEntry(
+  file: ChatgptFileSettings | undefined,
+  workspaces: readonly WorkspaceConfig[],
+  defaultWorkspace: string,
+): { preset: boolean; primary: string | undefined } {
+  if (file?.preset === false) {
+    return { preset: false, primary: undefined };
+  }
+  const primary = file?.primary ?? defaultWorkspace;
+  if (!workspaces.some((workspace) => workspace.name === primary)) {
+    const available = workspaces.map((workspace) => workspace.name).join(", ");
+    throw new ConfigError(
+      `invalid chatgpt.primary "${file?.primary}": unknown workspace (available: ${available}). ` +
+        `Pick a configured workspace or disable guided entry with { "chatgpt": { "preset": false } }.`,
+    );
+  }
+  return { preset: true, primary };
+}
+
+/**
+ * Default harness database path: `$XDG_CONFIG_HOME/workspace-mcp/harness.db`,
+ * or `~/.config/workspace-mcp/harness.db` when `XDG_CONFIG_HOME` is unset.
+ * The store validator rejects any path inside a Git repository at open, so
+ * this global location keeps harness state outside all repos by default.
+ */
+export function defaultHarnessDbPath(env: NodeJS.ProcessEnv = process.env): string {
+  const xdg = env.XDG_CONFIG_HOME?.trim();
+  const home = env.HOME?.trim();
+  const base = xdg !== undefined && xdg !== "" ? xdg : path.join(home !== undefined && home !== "" ? home : homedir(), ".config");
+  return path.join(base, "workspace-mcp", "harness.db");
+}
+
+/**
+ * Harness database path precedence: `WORKSPACE_MCP_HARNESS_DB` (when
+ * non-blank) > config-file `harness.dbPath` > global `harness.db` default.
+ * Pure: it never touches the filesystem.
+ */
+export function resolveHarnessDbPath(
+  fileDbPath: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const override = env.WORKSPACE_MCP_HARNESS_DB?.trim();
+  if (override !== undefined && override !== "") {
+    return override;
+  }
+  return fileDbPath ?? defaultHarnessDbPath(env);
+}
+
+/**
+ * Harness precedence: env/file/defaults with both flags defaulting off, so
+ * disabling `harness.session` restores the pre-harness tool surface. There
+ * is no CLI flag for the harness: explicit configuration or the environment
+ * override is the only way to enable it.
+ */
+export function resolveHarnessConfig(
+  file: HarnessFileSettings | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): { session: boolean; recall: boolean; dbPath: string } {
+  return {
+    session: file?.session ?? false,
+    recall: file?.recall ?? false,
+    dbPath: resolveHarnessDbPath(file?.dbPath, env),
+  };
+}
+
 function parseIntegerInRange(value: unknown, key: string, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
     throw new ConfigError(`invalid ${key}: ${JSON.stringify(value)} (expected an integer between ${min} and ${max})`);
@@ -476,6 +638,8 @@ function collectUnknownKeys(raw: Record<string, unknown>): string[] {
     ["shell", SHELL_KEYS],
     ["transport", TRANSPORT_KEYS],
     ["state", STATE_KEYS],
+    ["chatgpt", CHATGPT_KEYS],
+    ["harness", HARNESS_KEYS],
   ] as const) {
     const value = raw[section];
     if (isPlainObject(value)) {

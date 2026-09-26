@@ -8,7 +8,7 @@
 # The key can be saved once to ~/.config/tunnel-client/api-key (chmod 600);
 # after that this script never asks for it again.
 #
-# Usage: scripts/tunnel.sh [--root PATH] [--workspace NAME=PATH] [--config PATH] [--name NAME] [--ui-port N] [--reinit] [--shell|--shell-any]
+# Usage: scripts/tunnel.sh [--root PATH] [--workspace NAME=PATH] [--config PATH] [--preset chatgpt] [--name NAME] [--ui-port N] [--reinit] [--shell|--shell-any]
 #   --root PATH       Primary workspace root (required unless --workspace or --config is given,
 #                     or a global config exists at ~/.config/workspace-mcp/config.json)
 #   --workspace N=P   Extra named workspace served by the SAME server (repeatable).
@@ -16,10 +16,16 @@
 #                     Example: --workspace api=/path/to/other-project
 #   --config PATH     JSON config file passed through as --config PATH. Supplies
 #                     workspace, shell, transport and state defaults; CLI flags win.
+#   --preset chatgpt  Pinned ChatGPT first-run preset: exactly one primary workspace
+#                     (a single --root, one --workspace, or --config). Shell stays
+#                     DISABLED unless --shell/--shell-any is passed explicitly, and
+#                     the tunnel_id remains transport routing only, never identity.
 #   --name NAME       Optional second daemon profile (workspace-mcp-NAME, own UI port).
 #                     Not needed for multiple workspaces - use --workspace instead.
 #   --ui-port N       Local status UI port (default: 8080 without --name, auto-picked otherwise)
 #   --reinit          Recreate the tunnel-client profile even if it already exists
+#   --preset chatgpt  Pinned ChatGPT first-run preset (single primary workspace;
+#                     shell stays disabled unless --shell/--shell-any is passed)
 #   --shell           Enable run_command in allowlist mode (WORKSPACE_MCP_SHELL=1)
 #   --shell-any       Enable run_command unrestricted (WORKSPACE_MCP_SHELL_MODE=any)
 #
@@ -67,6 +73,7 @@ ROOT=""
 ROOT_EXPLICIT=0
 WORKSPACES=()
 CONFIG_FILE=""
+PRESET=""
 NAME=""
 UI_PORT=""
 REINIT=0
@@ -82,6 +89,9 @@ while [[ $# -gt 0 ]]; do
     --config)
       [[ $# -ge 2 ]] || { echo "ERROR: --config needs a value (path to a JSON config file)" >&2; exit 2; }
       CONFIG_FILE="$2"; shift 2 ;;
+    --preset)
+      [[ $# -ge 2 ]] || { echo "ERROR: --preset needs a value (only 'chatgpt' exists)" >&2; exit 2; }
+      PRESET="$2"; shift 2 ;;
     --name)
       [[ $# -ge 2 ]] || { echo "ERROR: --name needs a value" >&2; exit 2; }
       NAME="$2"; shift 2 ;;
@@ -104,8 +114,22 @@ for w in "${WORKSPACES[@]}"; do
   fi
 done
 
+# ChatGPT first-run preset: exactly one primary workspace, shell disabled by
+# default (explicit opt-in only), tunnel_id never treated as identity.
+if [[ -n "$PRESET" && "$PRESET" != "chatgpt" ]]; then
+  echo "ERROR: unknown preset '$PRESET' (only --preset chatgpt exists)" >&2
+  exit 2
+fi
+if [[ "$PRESET" == "chatgpt" && ${#WORKSPACES[@]} -gt 1 ]]; then
+  echo "ERROR: --preset chatgpt accepts exactly one workspace: pass a single --root, one --workspace, or --config" >&2
+  exit 2
+fi
+
 if [[ $ROOT_EXPLICIT -eq 0 && ${#WORKSPACES[@]} -gt 0 ]]; then
   ROOT=""            # server: the first --workspace becomes the primary
+elif [[ "$PRESET" == "chatgpt" ]]; then
+  echo "ERROR: --preset chatgpt needs a primary workspace: pass --root <path>, one --workspace <name>=<path>, or --config <path>" >&2
+  exit 2
 elif [[ $ROOT_EXPLICIT -eq 0 && -z "$CONFIG_FILE" ]]; then
   GLOBAL_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/workspace-mcp/config.json"
   if [[ -f "$GLOBAL_CONFIG" ]]; then
@@ -268,6 +292,12 @@ fi
 
 echo
 echo "Starting tunnel daemon [$PROFILE]"
+if [[ "$PRESET" == "chatgpt" ]]; then
+  echo "Preset: chatgpt single-workspace first run (tunnel_id is transport routing only, never session identity)."
+  if [[ -z "$SHELL_MODE" ]]; then
+    echo "run_command stays DISABLED (default). Pass --shell to opt in explicitly."
+  fi
+fi
 if [[ -n "$ROOT" ]]; then
   echo "  primary root: $ROOT"
 fi

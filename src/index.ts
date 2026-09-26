@@ -19,6 +19,7 @@ import {
 } from "./config.js";
 import { shutdownJobs } from "./jobs.js";
 import { createServer, FALLBACK_VERSION, SERVER_NAME } from "./server.js";
+import { openHarnessStore, type HarnessStore } from "./session-store.js";
 import type { ShellConfig } from "./shell.js";
 import type { WorkspaceConfig } from "./workspaces.js";
 
@@ -172,8 +173,13 @@ async function runStdio(
   defaultWorkspace: string,
   version: string,
   shell: ShellConfig,
+  harness?: { session?: boolean; recall?: boolean; store?: HarnessStore },
 ): Promise<void> {
-  const server = createServer({ workspaces, defaultWorkspace, version, shell });
+  // Harness sessions are explicit tokens only (change chatgpt-workspace-harness):
+  // continuity is by server-issued session/work token resolved inside
+  // src/tools/session.ts handlers against the shared outside-repo store.
+  // Bearer/session semantics live in runHttp below and in the handlers.
+  const server = createServer({ workspaces, defaultWorkspace, version, shell, harness });
   const transport = new StdioServerTransport();
   let shuttingDown = false;
 
@@ -206,6 +212,7 @@ async function runHttp(
   workspaces: WorkspaceConfig[],
   defaultWorkspace: string,
   version: string,
+  harness?: { session?: boolean; recall?: boolean; store?: HarnessStore },
 ): Promise<void> {
   if (token === undefined && !isLoopbackHost(transport.host)) {
     log(
@@ -239,8 +246,14 @@ async function runHttp(
       return;
     }
 
-    const server = createServer({ workspaces, defaultWorkspace, version, shell });
+    const server = createServer({ workspaces, defaultWorkspace, version, shell, harness });
     const serverTransport = new StreamableHTTPServerTransport({
+      // Stateless transport by design (change chatgpt-workspace-harness):
+      // kept undefined so every POST constructs a fresh McpServer. Session
+      // continuity is by explicit harness session/work token resolved inside
+      // src/tools/session.ts handlers against the shared outside-repo store —
+      // tunnel, connection, and profile identifiers are never identity. The
+      // single shared bearer below gates transport/tunnel access only.
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
     });
@@ -362,10 +375,38 @@ async function main(): Promise<void> {
     }
   }
 
+  // Harness store (change chatgpt-workspace-harness, tasks 3.2/4.2): opened
+  // once here and shared across stateless turns. Flag-off serves the
+  // pre-harness surface. An invalid store path aborts startup; request-time
+  // failures are explicit store-unavailable errors with no repo-local
+  // fallback. The optionals (Engram, obsidian-mcp) are never opened here, so
+  // startup never requires them; recall marks them degraded instead.
+  let harness: { session: boolean; recall: boolean; store: HarnessStore } | undefined;
+  if (resolved.harness.session || resolved.harness.recall) {
+    const store = openHarnessStore({
+      dbPath: resolved.harness.dbPath,
+      workspaceRoots: workspaceConfigs.map((workspace) => workspace.path),
+    });
+    try {
+      store.open();
+    } catch (error) {
+      log(`harness store unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+      return;
+    }
+    harness = { session: resolved.harness.session, recall: resolved.harness.recall, store };
+    if (resolved.harness.session) {
+      log(`harness sessions enabled (store: ${resolved.harness.dbPath})`);
+    }
+    if (resolved.harness.recall) {
+      log(`harness recall enabled (store: ${resolved.harness.dbPath})`);
+    }
+  }
+
   if (resolved.transport.http) {
-    await runHttp(resolved.transport, shell, options.token, workspaceConfigs, defaultWorkspace, version);
+    await runHttp(resolved.transport, shell, options.token, workspaceConfigs, defaultWorkspace, version, harness);
   } else {
-    await runStdio(workspaceConfigs, defaultWorkspace, version, shell);
+    await runStdio(workspaceConfigs, defaultWorkspace, version, shell, harness);
   }
 }
 

@@ -10,6 +10,7 @@ import {
   applyStateDefaults,
   ConfigError,
   CONFIG_FILE_NAME,
+  defaultHarnessDbPath,
   discoverConfigFile,
   globalConfigPath,
   loadConfigFile,
@@ -77,6 +78,8 @@ function makeLoaded(overrides: Partial<LoadedConfig> = {}): LoadedConfig {
     shell: {},
     transport: {},
     state: {},
+    chatgpt: {},
+    harness: {},
     path: "/tmp/workspace-mcp.config.json",
     explicit: false,
     ...overrides,
@@ -539,6 +542,137 @@ describe("transport and state resolution", () => {
     const noConfig: NodeJS.ProcessEnv = {};
     applyStateDefaults({ journalMaxBytes: undefined }, noConfig);
     expect(noConfig.WORKSPACE_MCP_JOURNAL_MAX_BYTES).toBeUndefined();
+  });
+});
+
+describe("chatgpt entry profile defaults", () => {
+  it("accepts a well-formed chatgpt section without touching workspaces", () => {
+    const data = validateConfig({ chatgpt: { preset: false } });
+    expect(data.chatgpt).toEqual({ preset: false });
+    expect(data.workspaces).toEqual([]);
+  });
+
+  it("rejects unknown nested chatgpt keys with their dotted path", () => {
+    expect(() => validateConfig({ chatgpt: { presets: true } })).toThrow(/chatgpt\.presets/);
+  });
+
+  it("rejects malformed chatgpt values", () => {
+    expect(() => validateConfig({ chatgpt: "yes" })).toThrow(/config key "chatgpt" must be an object/);
+    expect(() => validateConfig({ chatgpt: { preset: "yes" } })).toThrow(/invalid chatgpt\.preset/);
+    expect(() => validateConfig({ chatgpt: { primary: 5 } })).toThrow(/invalid chatgpt\.primary/);
+    expect(() => validateConfig({ chatgpt: { primary: "  " } })).toThrow(/invalid chatgpt\.primary/);
+  });
+
+  it("defaults the preset on with the default workspace as primary", () => {
+    const resolved = mergeWith(makeLoaded({ workspaces: [{ name: "api", path: "/w/api" }] }));
+    expect(resolved.chatgpt).toEqual({ preset: true, primary: "api" });
+  });
+
+  it("honors a configured primary workspace without disturbing selection", () => {
+    const resolved = mergeWith(
+      makeLoaded({
+        workspaces: [
+          { name: "api", path: "/w/api" },
+          { name: "web", path: "/w/web" },
+        ],
+        chatgpt: { primary: "web" },
+      }),
+    );
+    expect(resolved.chatgpt).toEqual({ preset: true, primary: "web" });
+    expect(resolved.workspaces).toHaveLength(2);
+    expect(resolved.defaultWorkspace).toBe("api");
+  });
+
+  it("rejects an unknown primary at startup without guessing", () => {
+    expect(() =>
+      mergeWith(makeLoaded({ workspaces: [{ name: "api", path: "/w/api" }], chatgpt: { primary: "nope" } })),
+    ).toThrow(/invalid chatgpt\.primary "nope"/);
+  });
+
+  it("disables guided entry while keeping explicit selection working", () => {
+    const resolved = mergeWith(
+      makeLoaded({
+        workspaces: [
+          { name: "api", path: "/w/api" },
+          { name: "web", path: "/w/web" },
+        ],
+        chatgpt: { preset: false },
+      }),
+    );
+    expect(resolved.chatgpt).toEqual({ preset: false, primary: undefined });
+    expect(resolved.workspaces).toHaveLength(2);
+    expect(resolved.defaultWorkspace).toBe("api");
+  });
+
+  it("accepts a CLI-added workspace as the primary", async () => {
+    const gamma = path.join(base, "chatgpt-cli-gamma");
+    await mkdir(gamma, { recursive: true });
+    const resolved = mergeWith(
+      makeLoaded({ workspaces: [{ name: "alpha", path: base }], chatgpt: { primary: "gamma" } }),
+      { workspaces: [`gamma=${gamma}`], cwd: base },
+    );
+    expect(resolved.chatgpt).toEqual({ preset: true, primary: "gamma" });
+  });
+});
+
+describe("harness config defaults", () => {
+  it("defaults the harness session and recall flags off with the global harness.db path", () => {
+    const resolved = mergeWith(makeLoaded({ workspaces: [{ name: "api", path: "/w/api" }] }));
+    expect(resolved.harness).toEqual({ session: false, recall: false, dbPath: defaultHarnessDbPath({}) });
+  });
+
+  it("accepts a well-formed harness section without touching workspaces", () => {
+    const data = validateConfig({ harness: { session: true, recall: false, dbPath: "/tmp/harness.db" } });
+    expect(data.harness).toEqual({ session: true, recall: false, dbPath: "/tmp/harness.db" });
+    expect(data.workspaces).toEqual([]);
+  });
+
+  it("rejects unknown nested harness keys with their dotted path", () => {
+    expect(() => validateConfig({ harness: { sessions: true } })).toThrow(/harness\.sessions/);
+  });
+
+  it("rejects malformed harness values", () => {
+    expect(() => validateConfig({ harness: "yes" })).toThrow(/config key "harness" must be an object/);
+    expect(() => validateConfig({ harness: { session: "yes" } })).toThrow(/invalid harness\.session/);
+    expect(() => validateConfig({ harness: { recall: 5 } })).toThrow(/invalid harness\.recall/);
+    expect(() => validateConfig({ harness: { dbPath: "" } })).toThrow(/invalid harness\.dbPath/);
+    expect(() => validateConfig({ harness: { dbPath: 5 } })).toThrow(/invalid harness\.dbPath/);
+  });
+
+  it("lets WORKSPACE_MCP_HARNESS_DB override the file dbPath", () => {
+    const resolved = mergeWith(makeLoaded({ harness: { session: true, dbPath: "/file/harness.db" } }), {
+      env: { WORKSPACE_MCP_HARNESS_DB: "/env/harness.db" },
+    });
+    expect(resolved.harness).toEqual({ session: true, recall: false, dbPath: "/env/harness.db" });
+  });
+
+  it("ignores a blank WORKSPACE_MCP_HARNESS_DB and keeps the file value", () => {
+    const resolved = mergeWith(makeLoaded({ harness: { session: true, dbPath: "/file/harness.db" } }), {
+      env: { WORKSPACE_MCP_HARNESS_DB: "   " },
+    });
+    expect(resolved.harness.dbPath).toBe("/file/harness.db");
+  });
+
+  it("keeps harness enabled without disturbing workspace selection", () => {
+    const resolved = mergeWith(
+      makeLoaded({
+        workspaces: [
+          { name: "api", path: "/w/api" },
+          { name: "web", path: "/w/web" },
+        ],
+        harness: { session: true },
+      }),
+    );
+    expect(resolved.harness.session).toBe(true);
+    expect(resolved.workspaces).toHaveLength(2);
+    expect(resolved.defaultWorkspace).toBe("api");
+  });
+
+  it("resolves the default harness db path under the global config dir", () => {
+    expect(defaultHarnessDbPath({ XDG_CONFIG_HOME: "/xdg" })).toBe("/xdg/workspace-mcp/harness.db");
+    const fallback = defaultHarnessDbPath({});
+    expect(path.isAbsolute(fallback)).toBe(true);
+    expect(fallback.endsWith(path.join("workspace-mcp", "harness.db"))).toBe(true);
   });
 });
 

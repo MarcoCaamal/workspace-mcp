@@ -90,6 +90,46 @@
           "description": "Default rotation threshold for journal.jsonl and notes.jsonl. The WORKSPACE_MCP_JOURNAL_MAX_BYTES environment variable wins when set."
         }
       }
+    },
+    "chatgpt": {
+      "type": "object",
+      "description": "ChatGPT guided-entry preset. Declarative first-run binding to one primary workspace; disabling it restores explicit-selection-only behavior.",
+      "additionalProperties": false,
+      "properties": {
+        "preset": {
+          "type": "boolean",
+          "default": true,
+          "description": "False disables the guided first-run preset. Explicit workspace selection keeps working."
+        },
+        "primary": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]*$",
+          "minLength": 1,
+          "description": "Workspace name the guided entry binds to. Must name a configured workspace; anything else aborts startup. Defaults to the default workspace."
+        }
+      }
+    },
+    "harness": {
+      "type": "object",
+      "description": "Stateful harness session store (Slice 2). Both flags default off; enabling session registers the session/work/stage tools backed by the outside-repo store. The store path is validated outside all Git repositories at open; a violation aborts startup.",
+      "additionalProperties": false,
+      "properties": {
+        "session": {
+          "type": "boolean",
+          "default": false,
+          "description": "True registers the session/work/stage/checkpoint tools. False restores the pre-harness tool surface."
+        },
+        "recall": {
+          "type": "boolean",
+          "default": false,
+          "description": "True enables the scoped recall extension (Slice 3). Inert until recall ships."
+        },
+        "dbPath": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Explicit harness database file path. WORKSPACE_MCP_HARNESS_DB wins when set. Defaults to $XDG_CONFIG_HOME/workspace-mcp/harness.db (or ~/.config/workspace-mcp/harness.db)."
+        }
+      }
     }
   }
 }

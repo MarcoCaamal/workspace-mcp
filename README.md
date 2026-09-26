@@ -6,7 +6,7 @@ The tool set is modelled after [opencode](https://opencode.ai)'s built-in tools 
 
 On top of that, the server keeps a small **workspace-local memory**: an automatic activity journal plus persistent notes (`work_log`, `remember`, `recall`), and read-only `git_status` / `git_diff` tools that work without the shell, so a new chat can recover context on its own.
 
-- Runtime: Node.js >= 22, ESM only
+- Runtime: Node.js >= 22.13, ESM only
 - Transports: stdio (default) and Streamable HTTP at `/mcp`
 - Zero runtime dependencies beyond `@modelcontextprotocol/sdk` and `zod`
 
@@ -18,7 +18,9 @@ On top of that, the server keeps a small **workspace-local memory**: an automati
 
 ## Requirements
 
-- Node.js 22 or newer
+- Node.js >= 22.13 (the harness session store uses the built-in `node:sqlite`
+  module, available unflagged from Node 22.13; `node:sqlite` is still
+  experimental in the 22.x line and its API may change)
 - pnpm (or npm) for building from source
 
 ## Install, build, run
@@ -283,6 +285,46 @@ node dist/index.js --root /path/to/project --workspace api=/path/to/other-projec
 - `workspace_list` (read-only) shows every workspace: name, absolute path, `(primary)` marker, whether `<root>/.workspace-mcp` exists, and the active change id when `state.json` exists.
 - **Isolation is per root.** Paths are confined to the selected root, and the journal, notes and change tracking live under the selected root's `.workspace-mcp/`. A `../` escape is rejected relative to the selected workspace even when the same path would be valid in another one.
 - **Shell tools follow the selection.** `run_command` and `start_job` resolve `cwd` against the selected workspace, and `git_status` / `git_diff` run `git -C <selected root>`.
+
+### ChatGPT guided entry
+
+New ChatGPT operators start here: [docs/CHATGPT_ENTRY.md](docs/CHATGPT_ENTRY.md)
+(pinned preset `scripts/tunnel.sh --preset chatgpt --root /path/to/project`,
+session convention, shell opt-in). Honesty note for this slice: the legacy
+writers `change_create`, `change_doc`, `task_add`, `work_log`, and `remember`
+create repo-local state under `<root>/.workspace-mcp/`; the no-artifacts
+workflow is not available in this slice.
+
+### Harness sessions (stateful SDD flow)
+
+Enable with the config file (`harness.session: true`, optional
+`harness.dbPath`, or `WORKSPACE_MCP_HARNESS_DB`); both harness flags default
+off. Eight tools are registered: `session_start`, `session_end`,
+`work_start`, `session_resume`, `stage_write`, `task_write`, `checkpoint`,
+`harness_status`.
+
+Quick path:
+
+1. `session_start` (binds one primary workspace, omit `workspace` to use the
+   configured primary) → opaque session token.
+2. `work_start { session }` → work token for one unit of work.
+3. `stage_write` / `task_write` per stage, then `checkpoint` carrying the
+   stored artifact id, then `harness_status` for the derived next action.
+4. `session_resume { session, work }` on any later turn, including after a
+   server restart: identity is by explicit token only.
+
+Details:
+
+| Topic | Contract |
+|-------|----------|
+| Stages | `explore → propose → spec → design → tasks → apply → verify`, listed by `harness_status` with the reason. Missing checkpoints are flagged unverified (honest, never a gate). |
+| Workspace binding | Every record pins its canonical workspace; an explicit `workspace` argument overrides the default for that call, and the same change id under two roots stays distinct. |
+| Identity limits | Tunnel, connection, and profile identifiers are never session identity. The shared HTTP bearer gates transport access only; within an authenticated tunnel, possession of a session/work token controls that session. There is no per-caller identity and no stronger conversation-isolation claim. |
+| Storage | Sessions, works, stage/task bodies, checkpoints, and summaries live only in the outside-repo store (`$XDG_CONFIG_HOME/workspace-mcp/harness.db` by default). The path is rejected inside any Git repository at startup, and an unreachable store fails writes explicitly with no repo-local fallback. |
+| Legacy separation | The legacy writers above still write repo-local state and serve the legacy flow only; the harness flow never calls them for new stage/task data. |
+| Restarts | Session/work/stage state survives restarts via the store; background jobs do not (pre-restart job ids report `unknown job id`). |
+
+Full contract: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ### ChatGPT tunnel and Codex examples
 
