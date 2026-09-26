@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { readNotes } from "../state.js";
+import type { CheckpointRecord, StageArtifactRecord } from "../session-store.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
 import { describeError, errorResult, textResult, workspaceArg } from "./shared.js";
 
@@ -56,4 +57,95 @@ function renderNote(note: { ts: string; text: string; tags: string[] }): string 
   }
   parts.push(note.text);
   return parts.join("  ");
+}
+
+/**
+ * Harness recall rendering (change chatgpt-workspace-harness, Slice 3).
+ *
+ * The legacy `recall` tool above is byte-compatible and untouched; everything
+ * below serves the scoped `harness_recall` surface registered from
+ * `src/tools/session.ts` and gated by `harness.recall` in `src/server.ts`.
+ */
+
+/** Optional enrichment sources; both stay optional and never block recall. */
+export type RecallEnrichmentSource = "engram" | "obsidian";
+
+/**
+ * One enrichment result line. Enrichers MUST scope their own lines to the
+ * presented session (and work, when the scope narrows to one); the handler
+ * drops any line whose scope does not match before returning.
+ */
+export interface RecallEnrichedLine {
+  text: string;
+  sessionId: string;
+  workId?: string;
+}
+
+export interface RecallEnrichment {
+  source: RecallEnrichmentSource;
+  lines: RecallEnrichedLine[];
+  /** True when the source was reachable and contributed lines. */
+  ok: boolean;
+}
+
+export interface RecallScope {
+  sessionId: string;
+  workId?: string;
+}
+
+export type RecallEnricher = (
+  query: string,
+  scope: RecallScope,
+) => Promise<RecallEnrichment>;
+
+/** Explicit marker appended whenever an optional source cannot enrich. */
+export function degradedMarker(source: RecallEnrichmentSource): string {
+  return `degraded: ${source}-unavailable`;
+}
+
+/**
+ * Scope filter for enrichment lines: keeps only lines scoped to the
+ * presented session (and work, when narrowed). Applied before return so an
+ * enricher can never leak cross-session rows into local results.
+ */
+export function filterEnrichedLines(
+  lines: readonly RecallEnrichedLine[],
+  scope: RecallScope,
+): RecallEnrichedLine[] {
+  return lines.filter(
+    (line) =>
+      line.sessionId === scope.sessionId &&
+      (scope.workId === undefined || line.workId === undefined || line.workId === scope.workId),
+  );
+}
+
+export function renderHarnessRecall(input: {
+  stages: readonly StageArtifactRecord[];
+  checkpoints: readonly CheckpointRecord[];
+  enriched: readonly RecallEnrichedLine[];
+  degraded: readonly RecallEnrichmentSource[];
+}): string {
+  const lines: string[] = [];
+  if (
+    input.stages.length === 0 &&
+    input.checkpoints.length === 0 &&
+    input.enriched.length === 0
+  ) {
+    lines.push("no harness results match");
+  }
+  for (const stage of input.stages) {
+    lines.push(`stage ${stage.stage} ${stage.id} [${stage.workspace}]: ${stage.body}`);
+  }
+  for (const checkpoint of input.checkpoints) {
+    lines.push(
+      `checkpoint ${checkpoint.seq} ${checkpoint.completedStage} [${checkpoint.workspace}]: ${checkpoint.summary}`,
+    );
+  }
+  for (const line of input.enriched) {
+    lines.push(line.text);
+  }
+  for (const source of input.degraded) {
+    lines.push(degradedMarker(source));
+  }
+  return lines.join("\n");
 }

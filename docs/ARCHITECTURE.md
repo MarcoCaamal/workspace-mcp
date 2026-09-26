@@ -213,6 +213,106 @@ Since v1.5.0 one process serves several named roots:
 - Shell tools follow the selection: `cwd` resolves against the selected root,
   and `git_status`/`git_diff` run `git -C <selected root>`.
 
+## Harness sessions (stateful SDD flow)
+
+Slice 2 adds server-issued session/work identity plus stage/task writes with
+explicit resume, backed from day one by a single outside-repo SQLite+FTS5
+store. It requires Node `>=22.13`: the store uses the built-in `node:sqlite`
+module (`DatabaseSync`), available unflagged from Node 22.13 but still
+experimental in the 22.x line. All SQL lives behind the single import site in
+`src/session-store.ts`, the schema is additive (`IF NOT EXISTS`) only, and no
+new runtime dependency is added.
+
+| Property | Value |
+| --- | --- |
+| Tools | `session_start`, `session_end`, `work_start`, `session_resume`, `stage_write`, `task_write`, `checkpoint`, `harness_status` in `src/tools/session.ts` (thin handlers; logic in `src/session-store.ts`); scoped `harness_recall` in `src/tools/session.ts` with rendering in `src/tools/recall.ts` |
+| Gate | Config `harness.session` (default off); flag-off restores the 19-tool pre-harness surface. Scoped recall is separately gated by `harness.recall` (default off); the legacy `recall` path stays byte-compatible either way |
+| Stages | `explore → propose → spec → design → tasks → apply → verify`; `harness_status` derives the next action from the external store |
+| Store | `$XDG_CONFIG_HOME/workspace-mcp/harness.db` (fallback `~/.config/...`), overridable by `harness.dbPath` or `WORKSPACE_MCP_HARNESS_DB` |
+| Recall | `checkpoint_fts` + `stage_artifact_fts` (FTS5, `bm25` ranking, `limit` clamped to 1–50); session required, work/workspace narrow; tokenless queries rejected |
+| Retention | Ended sessions retained 90 days, then removed by explicit purge only; over-cap bodies/summaries rejected, never truncated |
+
+### Identity and resume contract
+
+- `session_start` returns an opaque unguessable token (`crypto.randomUUID()`)
+  bound to one canonical workspace; `work_start` returns a work token bound to
+  its parent session. Every session-scoped call presents the tokens
+  explicitly; `session_resume` restores the work context plus the latest
+  checkpoint summary and derived next action across stateless turns and
+  restarts.
+- Token parentage is validated on every call (`work.sessionId == session`):
+  cross-session work tokens are rejected, never re-parented. A tokenless
+  session-scoped call is rejected and attaches to nothing; closed sessions
+  report closed and are never revived.
+- The tunnel, connection, and profile identifiers are never consulted for
+  identity. The single shared HTTP bearer gates transport access only.
+- Token-possession limits (stated honestly, not as a stronger claim): within
+  an authenticated tunnel, possession of a session/work token controls that
+  session. There is no per-caller identity, so no per-conversation isolation
+  beyond token possession is claimed.
+
+### Workspace binding and storage rules
+
+- Every record (session, work, stage artifact, task list, checkpoint) pins its
+  canonical (`realpath`) registered workspace; `changeId` is qualified by the
+  composite `(workspace, changeId)`. Cross-workspace use within one session is
+  permitted; each record pins the workspace it was created in.
+- New harness state — records and bodies alike — lives only in the
+  outside-repo store; checkpoints reference the stage artifact by its external
+  stored artifact id, never by repo-local path. The new flow never imports or
+  invokes the legacy repo writers (`src/state.ts`, `src/changes.ts`,
+  `src/tools/changes.ts`).
+- The resolved store path is canonicalized (realpath + longest-existing-prefix
+  per the `src/paths.ts` pattern) and dual-validated at open: outside every
+  configured root AND outside ANY Git repository (canonical-parent `.git`
+  dir-or-file walk, covering worktrees and submodules). A violation aborts
+  startup. Every write kind maps request-time persistence failure to an
+  explicit `store-unavailable` error with no repo-local fallback.
+- Primary-workspace first run: the guided entry binds the configured primary
+  (`chatgpt.primary`, defaulting to the default workspace); an explicit
+  `workspace` argument overrides the default for that call, and disabling the
+  preset leaves explicit selection untouched. `docs/CODE_STANDARDS.md` (basic
+  mode, flat layout, thin handlers) is unchanged by this change.
+
+### Scoped recall and hardening (Slice 3)
+
+- `harness_recall` searches stage bodies and checkpoint summaries within one
+  explicitly presented session (and optionally one work item), intersected
+  with the caller's registered-workspace scope. A tokenless query is
+  rejected; rows from other sessions, sibling works, or out-of-scope
+  workspaces are never returned. The legacy `recall`/`readNotes` path is
+  unchanged and never mixed into harness results.
+- Engram and the independent `obsidian-mcp` stay optional: startup never
+  requires them, recall answers from the local store first, and every
+  unreachable source is reported with an explicit `degraded:` marker.
+  Enrichment lines pass through the same session/work scope filter before
+  return.
+- Retention and caps (behind `harness.recall`): ended sessions are retained
+  90 days, then removed only by an explicit purge (live sessions never
+  purged); checkpoint summaries are model-authored and capped at 8000 chars,
+  stage/task bodies at 100000 chars — over-cap writes are rejected with a
+  typed error, never silently truncated; recall orders by FTS5 `bm25` with
+  `limit` clamped to 1–50.
+
+### Request flow (stateful turn)
+
+```txt
+ChatGPT turn (stateless POST, fresh McpServer; bearer gates transport only)
+  |  session_start / {session, work} + action
+  v
+src/index.ts handleRequest --> createServer(...) --> registerSessionTools
+  |  (shared store opened once at startup; tunnel ID never identity)
+  v
+src/tools/session.ts handler
+  |  validate (zod) -> registry.resolve + canonicalize(workspace)
+  |  -> validate token parentage + registered scope -> store call by token
+  |  -> NEVER calls change_create/change_doc/task_add/work_log/remember
+  v
+harness.db (OUTSIDE ALL repos, any-repo validated)
+  v
+text result: ids, canonical binding, artifact IDs, checkpoint summary, next action
+```
+
 ## Configuration
 
 Since v1.6.0 an optional JSON config file (`workspace-mcp.config.json`)

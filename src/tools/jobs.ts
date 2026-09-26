@@ -48,6 +48,8 @@ export function registerJobTools(server: McpServer, registry: WorkspaceRegistry,
         "The command is an argv array: the first item is the executable and the remaining items are its arguments. " +
         "There is NO shell: pipes (|), '&&', redirection (>), $VAR expansion and globs are not interpreted; pass every argument literally. " +
         `${modeDescription} ` +
+        "Like run_command, the job inherits a scrubbed environment: secret-bearing variables are removed before spawn. " +
+        "Re-attach with job_status (read-only, no confirmation needed) instead of starting a duplicate job. " +
         `The job's process group is killed after maxRuntimeMs (default ${defaultMaxRuntimeMs} ms, max ${MAX_MAX_RUNTIME_MS} ms).`,
       inputSchema: {
         command: z
@@ -112,7 +114,8 @@ export function registerJobTools(server: McpServer, registry: WorkspaceRegistry,
         "Read the status of a background job started with start_job. This tool is read-only and requires no confirmation. " +
         "With jobId: returns status (running, exited, killed, timed-out or failed-to-start), the exit code when exited, duration, log size and the tail of the log (ANSI-stripped). " +
         `Without jobId: lists the ${MAX_LISTED_JOBS} most recent jobs in this server process. ` +
-        "Jobs keep running when the client disconnects or the MCP request ends; only restarting the server kills them.",
+        "Jobs keep running when the client disconnects or the MCP request ends; only restarting the server kills them. " +
+        "Jobs do not survive a server restart: after a restart every pre-restart job id reports unknown job id.",
       inputSchema: {
         jobId: z.string().optional().describe("Job id returned by start_job. Omit to list the most recent jobs."),
         tailBytes: z
