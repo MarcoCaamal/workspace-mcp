@@ -32,7 +32,8 @@ Two properties shape the whole design:
 
 | Module | Responsibility |
 | --- | --- |
-| `src/index.ts` | Process entry point. Parses CLI flags and environment fallbacks, resolves workspace roots, selects the transport (stdio or Streamable HTTP), starts the server and installs `SIGINT`/`SIGTERM` shutdown handling. |
+| `src/index.ts` | Process entry point. Parses CLI flags, loads the optional config file, merges CLI > env > file > defaults, resolves workspace roots, selects the transport (stdio or Streamable HTTP), starts the server and installs `SIGINT`/`SIGTERM` shutdown handling. |
+| `src/config.ts` | Optional JSON config file: discovery (explicit `--config` -> cwd file -> global path), strict validation (unknown keys rejected, secrets refused) and the pure merge that implements the precedence rules. |
 | `src/server.ts` | Builds the `McpServer`, registers the enabled tool groups, and sets the instructions sent to clients (including the session-start / session-end convention). |
 | `src/workspaces.ts` | Workspace registry. Registers the primary root (`default`) and named roots, validates names, resolves the optional `workspace` argument on tools and produces the `workspace_list` output. |
 | `src/paths.ts` | The single containment implementation (`resolveSafe`). Canonicalizes the root and target with `fs.realpath`, walks to the nearest existing ancestor for targets that do not exist yet, and rejects anything that does not resolve inside the selected root. |
@@ -212,6 +213,50 @@ Since v1.5.0 one process serves several named roots:
 - Shell tools follow the selection: `cwd` resolves against the selected root,
   and `git_status`/`git_diff` run `git -C <selected root>`.
 
+## Configuration
+
+Since v1.6.0 an optional JSON config file (`workspace-mcp.config.json`)
+supplies defaults for workspaces, shell execution, transport and state. It is a
+defaults layer, never a replacement: with no file present, behavior is
+identical to previous versions.
+
+- **Discovery, first match wins:** `--config <path>` (error when missing or
+  invalid), then `./workspace-mcp.config.json` in the process cwd, then
+  `$XDG_CONFIG_HOME/workspace-mcp/config.json` (or `~/.config/...`). A
+  discovered file that exists but is invalid is a startup error - a broken
+  config must be loud.
+- **Validation is strict and hand-written** (`validateConfig`): only known keys
+  are accepted anywhere (typos fail loudly), `$schema` is accepted and
+  ignored, and a `token` key anywhere is refused because secrets must come from
+  `MCP_TOKEN` or `--token`. Workspace paths are resolved to absolute realpaths
+  and must exist. Bounds mirror the tool schemas (`shell.timeoutMs` 1000-600000,
+  `shell.maxRuntimeMs` 1000-7200000, `transport.port` 1-65535,
+  `state.journalMaxBytes` positive).
+- **One precedence rule everywhere:** CLI flags > environment variables >
+  config file > built-in defaults. `mergeConfig` is pure (no filesystem
+  access, no env mutation) so the whole matrix is unit-testable.
+- **Workspace merge:** file entries first, then `--workspace name=path`
+  overrides same-name entries or appends. `--root` maps to the name `default`
+  and overrides a config `default`. Primary is `default` when present, else the
+  first entry.
+- **Shell merge:** the tools are enabled by any CLI flag, `WORKSPACE_MCP_SHELL=1`
+  or config `shell.mode`; mode is CLI > env > file > `"allowlist"`; `allow` is
+  the union of built-in defaults, file, env and CLI (all basenames), while
+  `deny` only comes from file/env and is checked before the allowlist in both
+  modes, so no flag can remove a restriction.
+- **Timeouts:** `shell.timeoutMs` and `shell.maxRuntimeMs` become the defaults
+  for `run_command`/`start_job` when the per-call argument is omitted; per-call
+  arguments still win and keep their existing zod validation.
+- **State:** `state.journalMaxBytes` is applied as the default for
+  `WORKSPACE_MCP_JOURNAL_MAX_BYTES` only when that env var is unset, so the
+  env var wins and `src/state.ts` stays unchanged.
+
+**Why JSON and not TOML/YAML?** JSON is parsed natively by Node with zero new
+dependencies, is machine-checkable against a published JSON Schema for editor
+autocomplete (`schemas/config.schema.json`), and the existing tooling already
+speaks JSON. The tradeoffs are the lack of comments and trailing commas; the
+strict unknown-key rejection compensates by making mistakes visible.
+
 ## Security architecture
 
 The server runs with the user's OS permissions and is not a sandbox; the root
@@ -236,6 +281,7 @@ Full trust model, risks and reporting instructions: [SECURITY.md](SECURITY.md).
 | **No shell parsing.** Commands are argv arrays executed with `shell: false`. | Pipes, `&&`, redirection, `$VAR` expansion and globs are never interpreted, so user input cannot become shell syntax. | Callers must compose argv arrays explicitly; convenience shell one-liners are not available. |
 | **Allowlist is a guardrail, not a sandbox.** Only `path.basename(command[0])` is checked. | Prevents casual or accidental execution of arbitrary binaries. | `node -e`, `npx` and package scripts already execute arbitrary code, so the allowlist does not contain a malicious model. `--shell-any` skips the check entirely. |
 | **Files over SQLite.** Journal, notes and changes are JSON lines and JSON files. | Zero runtime dependencies, human-readable, trivially inspectable and backup-able, self-ignoring under git, atomic appends for log streams. | No queries or indexes; reads are linear and must be bounded (last 1 MiB, newest-first limits). |
+| **JSON config as a defaults layer.** One optional file fills in workspaces, shell, transport and state defaults. | Node parses JSON natively (zero dependencies), a published JSON Schema gives editors autocomplete, and precedence CLI > env > file > defaults keeps every existing invocation working unchanged. | No comments or trailing commas; strict validation rejects unknown keys and any `token` key, so a typo aborts startup instead of being ignored. |
 | **Derived next-action instead of hard gates.** `change_status` suggests the next step from the record. | The workflow stays flexible: documents can be written in any order and the agent is never blocked by a state machine. | Nothing enforces the suggested order; an agent can skip stages and the server will not object. |
 | **Process-global job registry.** Jobs live in the server process. | Jobs survive client timeouts, dropped transports and stateless HTTP requests, which is the point of the feature. | Restarting the server kills running jobs; there is no durable queue and no cross-process recovery. |
 | **Bounded reads + head/tail truncation.** Journal reads are capped at ~1 MiB, command output above 256 KiB keeps the first and last 32 KiB, `git_diff` keeps first/last 32 KiB of 64 KiB, job logs cap at 64 MiB. | Predictable memory and response sizes; the tail is where failures usually print. | Middle output can be lost; callers must raise limits explicitly when they need more. |

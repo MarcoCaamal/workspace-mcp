@@ -3,28 +3,36 @@ import { timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import path from "node:path";
 import { parseArgs } from "node:util";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  applyStateDefaults,
+  CONFIG_FILE_NAME,
+  ConfigError,
+  DEFAULT_HOST,
+  DEFAULT_PORT,
+  mergeConfig,
+  resolveConfigFile,
+  type ResolvedConfig,
+} from "./config.js";
 import { shutdownJobs } from "./jobs.js";
 import { createServer, FALLBACK_VERSION, SERVER_NAME } from "./server.js";
-import { DEFAULT_SHELL_ALLOW, type ShellConfig, type ShellMode } from "./shell.js";
-import { parseWorkspaceFlags, type WorkspaceConfig } from "./workspaces.js";
+import type { ShellConfig } from "./shell.js";
+import type { WorkspaceConfig } from "./workspaces.js";
 
-const DEFAULT_HOST = "127.0.0.1";
-const DEFAULT_PORT = 3333;
 const MCP_ENDPOINT = "/mcp";
 
 interface CliOptions {
   root: string | undefined;
   workspaces: string[] | undefined;
   http: boolean;
-  host: string;
-  port: number;
+  host: string | undefined;
+  port: number | undefined;
   token: string | undefined;
-  shell: ShellConfig;
+  shell: { flag: boolean; any: boolean; allow: string[] | undefined };
+  config: string | undefined;
   help: boolean;
   version: boolean;
 }
@@ -49,71 +57,31 @@ function printHelp(): void {
       "                  Names match ^[a-z0-9][a-z0-9_-]*$ and must be unique. With no --root,",
       "                  the first one is primary unless one is literally named 'default'.",
       "                  Every root is resolved to a real, existing absolute path at startup.",
+      "  --config <path> Use an explicit JSON config file. Without it, ./" + CONFIG_FILE_NAME,
+      "                  (cwd) is tried, then ~/.config/workspace-mcp/config.json",
+      "                  (or $XDG_CONFIG_HOME/workspace-mcp/config.json).",
+      "                  A config file that exists but is invalid aborts startup.",
       "  --http          Serve Streamable HTTP at /mcp instead of stdio.",
       `  --host <host>   HTTP bind host. Default: ${DEFAULT_HOST}.`,
       `  --port <port>   HTTP bind port. Default: ${DEFAULT_PORT}.`,
       "  --token <t>     Require 'Authorization: Bearer <t>' on every HTTP request (or set MCP_TOKEN).",
+      "                  Tokens are NOT allowed in the config file.",
       "  --shell         Enable run_command and the background job tools in allowlist mode. Off by default.",
       "  --shell-any     Enable them in unrestricted mode (any executable). Implies --shell and prints a warning.",
       "  --shell-allow <list>  Add executables to the allowlist (comma-separated and/or repeated; only used when enabled).",
       "  -h, --help      Show this help.",
       "  -v, --version   Show the version.",
       "",
+      "Config file: optional JSON that fills in defaults for workspaces, shell, transport and state.",
+      "Precedence everywhere: CLI flags > environment variables > config file > built-in defaults.",
+      "Unknown keys are rejected, and a 'token' key is refused (use MCP_TOKEN or --token).",
+      "",
       "Shell environment fallbacks (CLI flags win): WORKSPACE_MCP_SHELL=1,",
-      "WORKSPACE_MCP_SHELL_MODE=allowlist|any, WORKSPACE_MCP_SHELL_ALLOW=git,docker.",
+      "WORKSPACE_MCP_SHELL_MODE=allowlist|any, WORKSPACE_MCP_SHELL_ALLOW=git,docker,",
+      "WORKSPACE_MCP_SHELL_DENY=docker.",
       "",
     ].join("\n"),
   );
-}
-
-/**
- * Splits comma-separated and repeated values into executable names and reduces
- * each entry to its basename, so `--shell-allow /usr/bin/git` means `git`.
- */
-function parseAllowList(rawValues: readonly string[]): string[] {
-  const names: string[] = [];
-  for (const raw of rawValues) {
-    for (const part of raw.split(",")) {
-      const name = path.basename(part.trim());
-      if (name === "" || name === "." || name === "..") {
-        continue;
-      }
-      if (!names.includes(name)) {
-        names.push(name);
-      }
-    }
-  }
-  return names;
-}
-
-function parseShellConfig(values: {
-  shell: boolean;
-  "shell-any": boolean;
-  "shell-allow": string[] | undefined;
-}): ShellConfig {
-  const envModeRaw = process.env.WORKSPACE_MCP_SHELL_MODE;
-  let envMode: ShellMode | undefined;
-  if (envModeRaw === "any" || envModeRaw === "allowlist") {
-    envMode = envModeRaw;
-  } else if (envModeRaw !== undefined) {
-    throw new Error(`invalid WORKSPACE_MCP_SHELL_MODE: ${envModeRaw} (expected "allowlist" or "any")`);
-  }
-
-  const cliMode: ShellMode | undefined = values["shell-any"] ? "any" : values.shell ? "allowlist" : undefined;
-  const envEnabled = process.env.WORKSPACE_MCP_SHELL === "1";
-
-  const allow = [...DEFAULT_SHELL_ALLOW];
-  for (const name of parseAllowList([process.env.WORKSPACE_MCP_SHELL_ALLOW ?? "", ...(values["shell-allow"] ?? [])])) {
-    if (!allow.includes(name)) {
-      allow.push(name);
-    }
-  }
-
-  return {
-    enabled: cliMode !== undefined || envMode !== undefined || envEnabled,
-    mode: cliMode ?? envMode ?? "allowlist",
-    allow,
-  };
 }
 
 function parseCliOptions(argv: string[]): CliOptions {
@@ -122,6 +90,7 @@ function parseCliOptions(argv: string[]): CliOptions {
     options: {
       root: { type: "string" },
       workspace: { type: "string", multiple: true },
+      config: { type: "string" },
       http: { type: "boolean", default: false },
       host: { type: "string" },
       port: { type: "string" },
@@ -135,23 +104,27 @@ function parseCliOptions(argv: string[]): CliOptions {
     allowPositionals: false,
   });
 
-  const port = values.port === undefined ? DEFAULT_PORT : Number.parseInt(values.port, 10);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`invalid --port: ${values.port}`);
+  let port: number | undefined;
+  if (values.port !== undefined) {
+    port = Number.parseInt(values.port, 10);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`invalid --port: ${values.port}`);
+    }
   }
 
   return {
     root: values.root,
     workspaces: values.workspace,
+    config: values.config,
     http: values.http === true,
-    host: values.host ?? DEFAULT_HOST,
+    host: values.host,
     port,
     token: values.token ?? process.env.MCP_TOKEN ?? undefined,
-    shell: parseShellConfig({
-      shell: values.shell === true,
-      "shell-any": values["shell-any"] === true,
-      "shell-allow": values["shell-allow"],
-    }),
+    shell: {
+      flag: values.shell === true,
+      any: values["shell-any"] === true,
+      allow: values["shell-allow"],
+    },
     help: values.help === true,
     version: values.version === true,
   };
@@ -227,12 +200,14 @@ async function runStdio(
 }
 
 async function runHttp(
-  options: CliOptions,
+  transport: ResolvedConfig["transport"],
+  shell: ShellConfig,
+  token: string | undefined,
   workspaces: WorkspaceConfig[],
   defaultWorkspace: string,
   version: string,
 ): Promise<void> {
-  if (options.token === undefined && !isLoopbackHost(options.host)) {
+  if (token === undefined && !isLoopbackHost(transport.host)) {
     log(
       "SECURITY WARNING: HTTP mode is bound to a non-loopback host without a token. " +
         "Anyone who can reach this port gets full read/write access to the workspace. " +
@@ -254,7 +229,7 @@ async function runHttp(
       sendJsonRpcError(response, 404, -32601, "Not found");
       return;
     }
-    if (!isAuthorized(request, options.token)) {
+    if (!isAuthorized(request, token)) {
       sendUnauthorized(response);
       return;
     }
@@ -264,23 +239,23 @@ async function runHttp(
       return;
     }
 
-    const server = createServer({ workspaces, defaultWorkspace, version, shell: options.shell });
-    const transport = new StreamableHTTPServerTransport({
+    const server = createServer({ workspaces, defaultWorkspace, version, shell });
+    const serverTransport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
     });
-    const session = { server, transport };
+    const session = { server, transport: serverTransport };
     activeSessions.add(session);
 
     response.on("close", () => {
       activeSessions.delete(session);
-      void transport.close().catch(() => undefined);
+      void serverTransport.close().catch(() => undefined);
       void server.close().catch(() => undefined);
     });
 
     try {
-      await server.connect(transport);
-      await transport.handleRequest(request, response);
+      await server.connect(serverTransport);
+      await serverTransport.handleRequest(request, response);
     } catch (error) {
       log(`request error: ${error instanceof Error ? error.message : String(error)}`);
       if (!response.headersSent) {
@@ -291,14 +266,14 @@ async function runHttp(
 
   await new Promise<void>((resolve, reject) => {
     httpServer.once("error", reject);
-    httpServer.listen(options.port, options.host, () => {
+    httpServer.listen(transport.port, transport.host, () => {
       httpServer.off("error", reject);
       resolve();
     });
   });
 
-  log(`ready on http://${options.host}:${options.port}${MCP_ENDPOINT} (workspaces: ${workspaces.map((workspace) => workspace.name).join(", ")})`);
-  if (options.token !== undefined) {
+  log(`ready on http://${transport.host}:${transport.port}${MCP_ENDPOINT} (workspaces: ${workspaces.map((workspace) => workspace.name).join(", ")})`);
+  if (token !== undefined) {
     log("bearer token authentication is enabled");
   }
 
@@ -340,34 +315,57 @@ async function main(): Promise<void> {
     return;
   }
 
-  let workspaceConfigs: WorkspaceConfig[];
+  let resolved: ResolvedConfig;
   try {
-    workspaceConfigs = parseWorkspaceFlags({ root: options.root, workspaces: options.workspaces, cwd: process.cwd() });
+    const file = resolveConfigFile({ cwd: process.cwd(), explicitPath: options.config });
+    resolved = mergeConfig({
+      file,
+      cwd: process.cwd(),
+      env: process.env,
+      root: options.root,
+      workspaces: options.workspaces,
+      shell: options.shell,
+      transport: { http: options.http, host: options.host, port: options.port },
+    });
   } catch (error) {
     log(error instanceof Error ? error.message : String(error));
+    if (error instanceof ConfigError) {
+      process.exitCode = 1;
+      return;
+    }
     printHelp();
     process.exitCode = 2;
     return;
   }
-  const defaultWorkspace =
-    workspaceConfigs.find((workspace) => workspace.name === "default")?.name ?? workspaceConfigs[0]!.name;
 
-  if (options.shell.enabled) {
-    if (options.shell.mode === "any") {
+  applyStateDefaults(resolved.state, process.env);
+  if (resolved.configPath !== undefined) {
+    log(`using config file ${resolved.configPath}`);
+  }
+
+  const workspaceConfigs = resolved.workspaces;
+  const defaultWorkspace = resolved.defaultWorkspace;
+  const shell = resolved.shell;
+
+  if (shell.enabled) {
+    if (shell.mode === "any") {
       log(
         "SECURITY WARNING: run_command is enabled in UNRESTRICTED mode (--shell-any / WORKSPACE_MCP_SHELL_MODE=any). " +
           `Any executable can run with your OS user's permissions. This is NOT a sandbox ` +
           `(workspaces: ${workspaceConfigs.map((workspace) => workspace.path).join(", ")}).`,
       );
     } else {
-      log(`run_command enabled in allowlist mode (allowed: ${options.shell.allow.join(", ")})`);
+      log(`run_command enabled in allowlist mode (allowed: ${shell.allow.join(", ")})`);
+    }
+    if ((shell.deny ?? []).length > 0) {
+      log(`denied executables (enforced in every mode): ${shell.deny!.join(", ")}`);
     }
   }
 
-  if (options.http) {
-    await runHttp(options, workspaceConfigs, defaultWorkspace, version);
+  if (resolved.transport.http) {
+    await runHttp(resolved.transport, shell, options.token, workspaceConfigs, defaultWorkspace, version);
   } else {
-    await runStdio(workspaceConfigs, defaultWorkspace, version, options.shell);
+    await runStdio(workspaceConfigs, defaultWorkspace, version, shell);
   }
 }
 

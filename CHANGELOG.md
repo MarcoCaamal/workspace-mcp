@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0]
+
+### Added
+
+- Optional JSON configuration file as a defaults layer, never a replacement.
+  Discovery: `--config <path>`, then `./workspace-mcp.config.json`, then
+  `$XDG_CONFIG_HOME/workspace-mcp/config.json` (or `~/.config/...`). Unknown
+  keys and any `token` key are rejected with precise errors; a discovered file
+  that is invalid aborts startup.
+- `workspaces` in the config file: named roots merge with `--workspace` (CLI
+  overrides same-name entries and adds new ones) and `--root` overrides a
+  config `default`.
+- `shell.mode` (enables the shell tools), `shell.allow` (unioned with env and
+  CLI allowlists) and `shell.deny` (enforced before the allowlist in both
+  modes; no flag can remove it).
+- `shell.timeoutMs` and `shell.maxRuntimeMs` become the defaults for
+  `run_command` and `start_job` when the per-call argument is omitted.
+- `transport.type` / `host` / `port` config defaults and `state.journalMaxBytes`
+  (default for `WORKSPACE_MCP_JOURNAL_MAX_BYTES`, env wins).
+- `schemas/config.schema.json` (JSON Schema draft-07) for editor autocomplete.
+- `scripts/tunnel.sh --config <path>` passthrough.
+
 ## [1.5.0]
 
 ### Added
@@ -72,7 +94,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release: `read_file`, `write_file`, `edit_file`, `patch`, `grep` and
   `list_files` scoped to a workspace root, with path containment.
 
-[Unreleased]: https://github.com/MarcoCaamal/workspace-mcp/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/MarcoCaamal/workspace-mcp/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/MarcoCaamal/workspace-mcp/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/MarcoCaamal/workspace-mcp/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/MarcoCaamal/workspace-mcp/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/MarcoCaamal/workspace-mcp/compare/v1.3.0...v1.4.0
