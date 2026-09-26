@@ -21,6 +21,7 @@ import { describeError, errorResult, renderCapturedOutput, textResult, workspace
  */
 export function registerRunTool(server: McpServer, registry: WorkspaceRegistry, config: ShellConfig): void {
   const allowed = [...config.allow];
+  const defaultTimeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   const modeDescription =
     config.mode === "any"
@@ -41,7 +42,7 @@ export function registerRunTool(server: McpServer, registry: WorkspaceRegistry, 
         "No TTY is attached, so interactive and watch commands are not supported and will run until the timeout. " +
         `${modeDescription} ` +
         "Output is stripped of ANSI escape codes and truncated in the middle when it exceeds 256 KiB. " +
-        `Defaults: cwd is the workspace root and timeoutMs is ${DEFAULT_TIMEOUT_MS} (max ${MAX_TIMEOUT_MS}); a timeout kills the whole process group.`,
+        `Defaults: cwd is the workspace root and timeoutMs is ${defaultTimeoutMs} (max ${MAX_TIMEOUT_MS}); a timeout kills the whole process group.`,
       inputSchema: {
         command: z
           .array(z.string().min(1))
@@ -59,7 +60,7 @@ export function registerRunTool(server: McpServer, registry: WorkspaceRegistry, 
           .min(MIN_TIMEOUT_MS)
           .max(MAX_TIMEOUT_MS)
           .optional()
-          .describe(`Timeout in milliseconds. Defaults to ${DEFAULT_TIMEOUT_MS} and is capped at ${MAX_TIMEOUT_MS}.`),
+          .describe(`Timeout in milliseconds. Defaults to ${defaultTimeoutMs} and is capped at ${MAX_TIMEOUT_MS}.`),
         workspace: workspaceArg(),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
@@ -84,7 +85,7 @@ export function registerRunTool(server: McpServer, registry: WorkspaceRegistry, 
 
         const result = await executeCommand(executable, command.slice(1), {
           cwd: workingDirectory,
-          timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
+          timeoutMs: timeoutMs ?? defaultTimeoutMs,
         });
 
         if (result.spawnError !== undefined) {

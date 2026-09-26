@@ -1,0 +1,95 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/MarcoCaamal/workspace-mcp/main/schemas/config.schema.json",
+  "title": "workspace-mcp configuration file",
+  "description": "Optional JSON configuration for the workspace-mcp server. The file is a defaults layer, never a replacement: CLI flags > environment variables > this file > built-in defaults. Secrets are not allowed here; pass the HTTP bearer token with --token or MCP_TOKEN.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference for editor autocomplete; accepted and ignored by the server."
+    },
+    "workspaces": {
+      "type": "object",
+      "description": "Named workspace roots. The workspace named \"default\" is primary when present, otherwise the first key. Relative paths resolve against the directory containing this file and every path must exist.",
+      "propertyNames": {
+        "pattern": "^[a-z0-9][a-z0-9_-]*$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Absolute path to an existing directory (relative paths resolve against the config file directory)."
+      }
+    },
+    "shell": {
+      "type": "object",
+      "description": "Defaults for the opt-in run_command / start_job tools. Setting shell.mode enables the tools, as if --shell was passed.",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["allowlist", "any"],
+          "description": "allowlist restricts executables to shell.allow plus the built-in defaults; any skips the allowlist check."
+        },
+        "allow": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Extra executable names allowed in allowlist mode. Unioned with the built-in defaults, WORKSPACE_MCP_SHELL_ALLOW and --shell-allow."
+        },
+        "deny": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Executable names rejected in every mode, before the allowlist. A restriction: no CLI flag can remove it."
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 600000,
+          "description": "Default run_command timeout when the caller omits timeoutMs (built-in default 120000)."
+        },
+        "maxRuntimeMs": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 7200000,
+          "description": "Default start_job max runtime when the caller omits maxRuntimeMs (built-in default 1800000)."
+        }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "description": "Transport defaults. CLI flags win.",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["stdio", "http"],
+          "description": "http behaves like --http; stdio is the default."
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "description": "HTTP bind host (default 127.0.0.1)."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "HTTP bind port (default 3333)."
+        }
+      }
+    },
+    "state": {
+      "type": "object",
+      "description": "Workspace state defaults.",
+      "additionalProperties": false,
+      "properties": {
+        "journalMaxBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Default rotation threshold for journal.jsonl and notes.jsonl. The WORKSPACE_MCP_JOURNAL_MAX_BYTES environment variable wins when set."
+        }
+      }
+    }
+  }
+}

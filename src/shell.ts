@@ -11,6 +11,15 @@ export interface ShellConfig {
   mode: ShellMode;
   /** Executable names (compared against `path.basename(command[0])`). */
   allow: string[];
+  /**
+   * Executable names that are always rejected, in both modes. A restriction
+   * only: no CLI flag can remove it, and it is checked before the allowlist.
+   */
+  deny?: string[];
+  /** Default `run_command` timeout used when the caller omits `timeoutMs`. */
+  timeoutMs?: number;
+  /** Default `start_job` max runtime used when the caller omits `maxRuntimeMs`. */
+  maxRuntimeMs?: number;
 }
 
 /** Executables allowed when the user does not extend the allowlist. */
@@ -46,6 +55,9 @@ export function executableRejection(config: ShellConfig, command: readonly strin
     return "command must contain at least one item";
   }
   const executableName = path.basename(executable);
+  if ((config.deny ?? []).includes(executableName)) {
+    return `command denied by configuration: ${executableName}`;
+  }
   if (config.mode === "allowlist" && !config.allow.includes(executableName)) {
     return (
       `command not allowed: ${executableName}. Allowed executables: ${formatList(config.allow)}. ` +

@@ -29,6 +29,7 @@ import { describeError, errorResult, renderCapturedOutputBody, textResult, works
  */
 export function registerJobTools(server: McpServer, registry: WorkspaceRegistry, config: ShellConfig): void {
   const allowed = [...config.allow];
+  const defaultMaxRuntimeMs = config.maxRuntimeMs ?? DEFAULT_MAX_RUNTIME_MS;
   const primaryRoot = registry.resolve().root;
   const modeDescription =
     config.mode === "any"
@@ -47,7 +48,7 @@ export function registerJobTools(server: McpServer, registry: WorkspaceRegistry,
         "The command is an argv array: the first item is the executable and the remaining items are its arguments. " +
         "There is NO shell: pipes (|), '&&', redirection (>), $VAR expansion and globs are not interpreted; pass every argument literally. " +
         `${modeDescription} ` +
-        `The job's process group is killed after maxRuntimeMs (default ${DEFAULT_MAX_RUNTIME_MS} ms, max ${MAX_MAX_RUNTIME_MS} ms).`,
+        `The job's process group is killed after maxRuntimeMs (default ${defaultMaxRuntimeMs} ms, max ${MAX_MAX_RUNTIME_MS} ms).`,
       inputSchema: {
         command: z
           .array(z.string().min(1))
@@ -64,7 +65,7 @@ export function registerJobTools(server: McpServer, registry: WorkspaceRegistry,
           .min(MIN_MAX_RUNTIME_MS)
           .max(MAX_MAX_RUNTIME_MS)
           .optional()
-          .describe(`Kill the job after this many milliseconds. Defaults to ${DEFAULT_MAX_RUNTIME_MS} and is capped at ${MAX_MAX_RUNTIME_MS}.`),
+          .describe(`Kill the job after this many milliseconds. Defaults to ${defaultMaxRuntimeMs} and is capped at ${MAX_MAX_RUNTIME_MS}.`),
         workspace: workspaceArg(),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
@@ -91,7 +92,7 @@ export function registerJobTools(server: McpServer, registry: WorkspaceRegistry,
           args: command.slice(1),
           cwd: workingDirectory,
           name,
-          maxRuntimeMs,
+          maxRuntimeMs: maxRuntimeMs ?? config.maxRuntimeMs,
         });
         await appendJournal(root, { tool: "start_job", detail, result: `started (${job.id})` });
         return textResult(renderJobStarted(job));

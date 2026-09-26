@@ -8,11 +8,14 @@
 # The key can be saved once to ~/.config/tunnel-client/api-key (chmod 600);
 # after that this script never asks for it again.
 #
-# Usage: scripts/tunnel.sh [--root PATH] [--workspace NAME=PATH] [--name NAME] [--ui-port N] [--reinit] [--shell|--shell-any]
-#   --root PATH       Primary workspace root (required unless --workspace is given)
+# Usage: scripts/tunnel.sh [--root PATH] [--workspace NAME=PATH] [--config PATH] [--name NAME] [--ui-port N] [--reinit] [--shell|--shell-any]
+#   --root PATH       Primary workspace root (required unless --workspace or --config is given,
+#                     or a global config exists at ~/.config/workspace-mcp/config.json)
 #   --workspace N=P   Extra named workspace served by the SAME server (repeatable).
 #                     If --root is omitted, the first --workspace becomes the primary.
 #                     Example: --workspace api=/path/to/other-project
+#   --config PATH     JSON config file passed through as --config PATH. Supplies
+#                     workspace, shell, transport and state defaults; CLI flags win.
 #   --name NAME       Optional second daemon profile (workspace-mcp-NAME, own UI port).
 #                     Not needed for multiple workspaces - use --workspace instead.
 #   --ui-port N       Local status UI port (default: 8080 without --name, auto-picked otherwise)
@@ -32,12 +35,16 @@ KEY_FILE="$HOME/.config/tunnel-client/api-key"
 
 usage() {
   cat <<'EOF'
-Usage: tunnel.sh [--root PATH] [--workspace NAME=PATH] [--name NAME] [--ui-port N] [--reinit] [--shell|--shell-any]
+Usage: tunnel.sh [--root PATH] [--workspace NAME=PATH] [--config PATH] [--name NAME] [--ui-port N] [--reinit] [--shell|--shell-any]
 
-  --root PATH       Primary workspace root (required unless --workspace is given)
+  --root PATH       Primary workspace root (required unless --workspace or --config is given,
+                    or a global config exists at ~/.config/workspace-mcp/config.json)
   --workspace N=P   Extra named workspace served by the SAME server (repeatable).
                     If --root is omitted, the first --workspace becomes the primary.
                     Each workspace keeps its own journal/changes state.
+  --config PATH     JSON config file passed through as --config PATH. Supplies
+                    workspace, shell, transport and state defaults; CLI flags win.
+                    The file must exist.
   --name NAME       Optional second daemon profile (workspace-mcp-NAME, own UI port).
                     Not needed for multiple workspaces - use --workspace instead.
   --ui-port N       Local status UI port (default 8080; auto-picked per --name)
@@ -59,6 +66,7 @@ EOF
 ROOT=""
 ROOT_EXPLICIT=0
 WORKSPACES=()
+CONFIG_FILE=""
 NAME=""
 UI_PORT=""
 REINIT=0
@@ -71,6 +79,9 @@ while [[ $# -gt 0 ]]; do
     --workspace)
       [[ $# -ge 2 ]] || { echo "ERROR: --workspace needs a value (<name>=<path>)" >&2; exit 2; }
       WORKSPACES+=("$2"); shift 2 ;;
+    --config)
+      [[ $# -ge 2 ]] || { echo "ERROR: --config needs a value (path to a JSON config file)" >&2; exit 2; }
+      CONFIG_FILE="$2"; shift 2 ;;
     --name)
       [[ $# -ge 2 ]] || { echo "ERROR: --name needs a value" >&2; exit 2; }
       NAME="$2"; shift 2 ;;
@@ -85,33 +96,54 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Workspace validation (name=path, lowercase name, no spaces).
+# Workspace validation (name=path, lowercase name).
 for w in "${WORKSPACES[@]}"; do
   if [[ ! "$w" =~ ^[a-z0-9][a-z0-9_-]*= ]]; then
     echo "ERROR: --workspace must be <name>=<path> with a lowercase name (e.g. api=/path/to/repo): $w" >&2
-    exit 2
-  fi
-  if [[ "$w" == *[[:space:]]* ]]; then
-    echo "ERROR: --workspace values must not contain spaces: $w" >&2
     exit 2
   fi
 done
 
 if [[ $ROOT_EXPLICIT -eq 0 && ${#WORKSPACES[@]} -gt 0 ]]; then
   ROOT=""            # server: the first --workspace becomes the primary
-elif [[ $ROOT_EXPLICIT -eq 0 ]]; then
-  echo "ERROR: pass --root <path> or --workspace <name>=<path>" >&2
-  exit 2
+elif [[ $ROOT_EXPLICIT -eq 0 && -z "$CONFIG_FILE" ]]; then
+  GLOBAL_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/workspace-mcp/config.json"
+  if [[ -f "$GLOBAL_CONFIG" ]]; then
+    CONFIG_FILE="$GLOBAL_CONFIG"
+    echo "Using global config: $CONFIG_FILE"
+  else
+    echo "ERROR: pass --root <path>, --workspace <name>=<path> or --config <path>" >&2
+    exit 2
+  fi
 fi
 
 # Exact mcp-command for this configuration (also used to detect profile drift).
-MCP_CMD="$NODE $SERVER"
+# tunnel-client parses this string into argv (it does not run a shell). Leave
+# simple arguments unchanged; quote and escape only those needing protection.
+command_arg() {
+  local arg="$1"
+  if [[ "$arg" == *[[:space:]]* || "$arg" == *"'"* || "$arg" == *\"* || "$arg" == *\\* ]]; then
+    arg="${arg//\\/\\\\}"
+    arg="${arg//\"/\\\"}"
+    printf '"%s"' "$arg"
+  else
+    printf '%s' "$arg"
+  fi
+}
+MCP_CMD="$(command_arg "$NODE") $(command_arg "$SERVER")"
 if [[ -n "$ROOT" ]]; then
-  MCP_CMD+=" --root $ROOT"
+  MCP_CMD+=" --root $(command_arg "$ROOT")"
 fi
 for w in "${WORKSPACES[@]}"; do
-  MCP_CMD+=" --workspace $w"
+  MCP_CMD+=" --workspace $(command_arg "$w")"
 done
+if [[ -n "$CONFIG_FILE" ]]; then
+  MCP_CMD+=" --config $(command_arg "$CONFIG_FILE")"
+fi
+# The existing profile reader captures the inside of a YAML double-quoted
+# scalar, so compare against its escaped representation rather than raw argv.
+PROFILE_CMD="${MCP_CMD//\\/\\\\}"
+PROFILE_CMD="${PROFILE_CMD//\"/\\\"}"
 
 if [[ -n "$NAME" && ! "$NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
   echo "ERROR: --name must be lowercase letters, numbers and dashes (e.g. dev)" >&2
@@ -160,6 +192,9 @@ fi
 [[ -f "$SERVER" ]] || {
   echo "ERROR: $SERVER is missing. Run 'pnpm build' in the repository root first." >&2
   exit 1; }
+if [[ -n "$CONFIG_FILE" ]]; then
+  [[ -f "$CONFIG_FILE" ]] || { echo "ERROR: config file does not exist: $CONFIG_FILE" >&2; exit 1; }
+fi
 if [[ -n "$ROOT" ]]; then
   [[ -d "$ROOT" ]] || { echo "ERROR: workspace root does not exist: $ROOT" >&2; exit 1; }
 fi
@@ -192,7 +227,7 @@ CURRENT_CMD=""
 if [[ -f "$PROFILE_FILE" ]]; then
   CURRENT_CMD="$(sed -n 's/^[[:space:]]*command:[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$PROFILE_FILE" | head -n1)"
 fi
-if [[ -f "$PROFILE_FILE" && $REINIT -eq 0 && -n "$CURRENT_CMD" && "$CURRENT_CMD" == "$MCP_CMD" ]]; then
+if [[ -f "$PROFILE_FILE" && $REINIT -eq 0 && -n "$CURRENT_CMD" && "$CURRENT_CMD" == "$PROFILE_CMD" ]]; then
   echo "Profile '$PROFILE' already exists and matches this configuration."
 else
   TUNNEL_ID=""
@@ -235,6 +270,9 @@ echo
 echo "Starting tunnel daemon [$PROFILE]"
 if [[ -n "$ROOT" ]]; then
   echo "  primary root: $ROOT"
+fi
+if [[ -n "$CONFIG_FILE" ]]; then
+  echo "  config file: $CONFIG_FILE"
 fi
 for w in "${WORKSPACES[@]}"; do
   echo "  workspace: $w"

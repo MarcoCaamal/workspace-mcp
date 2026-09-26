@@ -2,7 +2,7 @@
 
 A Model Context Protocol (MCP) server that gives an agent in any MCP-capable chat client a small, safe filesystem toolkit scoped to **one or more named project workspaces**: read, write, edit, patch, grep and list. The point is to remove copy-paste: instead of asking the user to paste file contents into the chat, the agent reads, searches and edits files directly through typed tools with a containment boundary that rejects everything outside the selected workspace root. Since v1.5.0 one server process can serve several projects at once, and every path or state tool takes an optional `workspace` argument.
 
-The tool set is modelled after [opencode](https://opencode.ai)'s built-in tools (`read`, `write`, `edit`, `patch`, `grep`, `glob`), plus an **opt-in** `run_command` tool for tests, linters and builds. Command execution is **off by default** and only registers when you ask for it with `--shell` (allowlist) or `--shell-any` (unrestricted).
+The tool set is modelled after [opencode](https://opencode.ai)'s built-in tools (`read`, `write`, `edit`, `patch`, `grep`, `glob`), plus an **opt-in** `run_command` tool for tests, linters and builds. Command execution is **off by default** and only registers when you ask for it with `--shell` (allowlist), `--shell-any` (unrestricted) or a [config file](#configuration-file) that sets `shell.mode`.
 
 On top of that, the server keeps a small **workspace-local memory**: an automatic activity journal plus persistent notes (`work_log`, `remember`, `recall`), and read-only `git_status` / `git_diff` tools that work without the shell, so a new chat can recover context on its own.
 
@@ -40,6 +40,7 @@ node dist/index.js --root /absolute/path/to/project --http --port 3333 --token "
 | --- | --- | --- |
 | `--root <dir>` | `process.cwd()` | Primary workspace root, registered as the workspace named `default`. Resolved to an absolute, symlink-free path. All tool paths must stay inside the selected workspace. |
 | `--workspace <name>=<path>` | | Register an additional named workspace. Repeatable. Names match `^[a-z0-9][a-z0-9_-]*$` and must be unique. Without `--root`, the first one is primary unless one is literally named `default`. A value without `=`, an invalid or duplicate name, or a non-existent path aborts startup. |
+| `--config <path>` | discovery | Use an explicit JSON config file (see [Configuration file](#configuration-file)). The file must exist and be valid or the server exits `1`. Without this flag, `./workspace-mcp.config.json` and then the global path are tried. |
 | `--http` | off | Serve Streamable HTTP at `/mcp` instead of stdio. |
 | `--host <host>` | `127.0.0.1` | HTTP bind host. |
 | `--port <n>` | `3333` | HTTP bind port. |
@@ -50,13 +51,78 @@ node dist/index.js --root /absolute/path/to/project --http --port 3333 --token "
 | `-h`, `--help` | | Print usage. |
 | `-v`, `--version` | | Print the version. |
 
-Shell environment fallbacks (CLI flags take precedence): `WORKSPACE_MCP_SHELL=1` enables allowlist mode, `WORKSPACE_MCP_SHELL_MODE=allowlist|any` sets the mode (setting it also enables the tool), `WORKSPACE_MCP_SHELL_ALLOW=git,docker` extends the allowlist.
+Shell environment fallbacks (CLI flags take precedence): `WORKSPACE_MCP_SHELL=1` enables allowlist mode, `WORKSPACE_MCP_SHELL_MODE=allowlist|any` sets the mode (setting it also enables the tool), `WORKSPACE_MCP_SHELL_ALLOW=git,docker` extends the allowlist, `WORKSPACE_MCP_SHELL_DENY=docker` always rejects those executables.
 
 Notes:
 
 - In stdio mode the server **never writes to stdout** (that is the protocol stream). All diagnostics go to stderr.
 - `SIGINT`/`SIGTERM` trigger a graceful shutdown (transports and HTTP server are closed).
 - If `--http` is used without a token on a non-loopback host, the server prints a loud security warning to stderr.
+
+## Configuration file
+
+Since v1.6.0 one optional JSON file can supply defaults for workspaces, shell execution, transport and state. It is a **defaults layer, never a replacement**, and with no file present the behavior is identical to previous versions. Editor autocomplete is available through [`schemas/config.schema.json`](schemas/config.schema.json).
+
+### Discovery (first match wins)
+
+1. `--config <path>` — explicit. If the file is missing or invalid the server exits `1` with a clear message.
+2. `./workspace-mcp.config.json` in the process working directory.
+3. `$XDG_CONFIG_HOME/workspace-mcp/config.json`, or `~/.config/workspace-mcp/config.json` when `XDG_CONFIG_HOME` is unset.
+
+A discovered file that exists but is invalid is a **startup error**, never silently ignored: a broken config must be loud. An explicit `--config` path wins even when a cwd or global file also exists.
+
+### Full example
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/MarcoCaamal/workspace-mcp/main/schemas/config.schema.json",
+  "workspaces": { "default": "/abs/path", "api": "/abs/other" },
+  "shell": {
+    "mode": "allowlist",
+    "allow": ["pnpm", "npm", "node", "git"],
+    "deny": ["docker"],
+    "timeoutMs": 300000,
+    "maxRuntimeMs": 3600000
+  },
+  "transport": { "type": "stdio", "host": "127.0.0.1", "port": 3333 },
+  "state": { "journalMaxBytes": 10485760 }
+}
+```
+
+Rules that apply to the whole file:
+
+- `$schema` is accepted and ignored.
+- **Unknown keys anywhere are rejected** (typo protection), and a `token` key anywhere is refused with `token must not be stored in the config file; use MCP_TOKEN or --token`. **Secrets never belong in this file.**
+- `workspaces` is a map name → path. Names match `^[a-z0-9][a-z0-9_-]*$`; paths are resolved to absolute realpaths and must exist (relative paths resolve against the directory containing the config file). The workspace named `default` is primary when present, otherwise the first key.
+- `shell.mode` is `"allowlist"` or `"any"`. **Its presence enables the shell tools**, as if `--shell` was passed.
+- `shell.allow` / `shell.deny` are executable names (basenames are extracted; `"/usr/bin/docker"` means `docker`).
+- `shell.timeoutMs` (1000–600000) becomes the default `run_command` timeout when the call omits `timeoutMs`; `shell.maxRuntimeMs` (1000–7200000) becomes the default `start_job` max runtime. Per-call arguments still win and are validated against the same caps.
+- `transport.type`, `transport.host` and `transport.port` behave exactly like `--http`, `--host` and `--port`; `transport.type: "http"` starts the HTTP server.
+- `state.journalMaxBytes` is applied as the default for `WORKSPACE_MCP_JOURNAL_MAX_BYTES`.
+
+### Precedence
+
+The same order applies everywhere: **CLI flags > environment variables > config file > built-in defaults**.
+
+| Setting | CLI | Env | Config | Built-in default |
+| --- | --- | --- | --- | --- |
+| Workspaces | `--root`, `--workspace` (override same-name / add new) | — | `workspaces` | cwd as `default` |
+| Shell on/off | `--shell`, `--shell-any` | `WORKSPACE_MCP_SHELL=1` | `shell.mode` present | off |
+| Shell mode | `--shell-any` (any), `--shell` (allowlist) | `WORKSPACE_MCP_SHELL_MODE` | `shell.mode` | `allowlist` |
+| Shell allow | `--shell-allow` | `WORKSPACE_MCP_SHELL_ALLOW` | `shell.allow` | `pnpm npm npx node` (union of layers) |
+| Shell deny | — | `WORKSPACE_MCP_SHELL_DENY` | `shell.deny` | none |
+| `run_command` timeout | `timeoutMs` argument | — | `shell.timeoutMs` | `120000` ms |
+| `start_job` runtime | `maxRuntimeMs` argument | — | `shell.maxRuntimeMs` | `1800000` ms |
+| Transport | `--http`, `--host`, `--port` | — | `transport.*` | stdio / `127.0.0.1` / `3333` |
+| Journal rotation | — | `WORKSPACE_MCP_JOURNAL_MAX_BYTES` | `state.journalMaxBytes` | 5 MiB |
+| HTTP bearer token | `--token` | `MCP_TOKEN` | **never** | none |
+
+Notes on the merge:
+
+- **Workspaces merge by name**: config entries come first, then `--workspace name=path` entries override same-name entries or add new ones, so a CLI workspace can extend the file's set without retyping it. `--root` maps to name `default` and overrides any config `default`.
+- **Allowlists are a union** of the built-in defaults, config, env and CLI (all reduced to basenames), so `--shell-allow` never narrows anything. To restrict, use `shell.deny`.
+- **Deny is a restriction**: it is checked **before** the allowlist in both `allowlist` and `any` mode, and no CLI flag can remove it. A denied command fails with `command denied by configuration: <name>`.
+- The HTTP bearer token is deliberately **not** configurable through the file.
 
 ## Tools
 
@@ -211,6 +277,7 @@ node dist/index.js --root /path/to/project --workspace api=/path/to/other-projec
 
 - `--root <dir>` registers the primary workspace named `default`. `--root` alone behaves exactly as before (fully backward compatible).
 - `--workspace <name>=<path>` is repeatable and registers another workspace. Names must match `^[a-z0-9][a-z0-9_-]*$`. A missing `=`, an invalid name, a duplicate name (including `--workspace default=...` next to `--root`) or a non-existent path aborts startup with a clear message.
+- Workspaces can also be declared in the [config file](#configuration-file) `workspaces` map. CLI entries override same-name config entries and add new ones; `--root` overrides a config `default`.
 - With only `--workspace` flags, the first one is primary unless one is literally named `default`. With no flags at all, the current working directory is the single primary workspace named `default`.
 - Every path or state tool accepts an optional `workspace` argument, for example `read_file { "path": "src/index.ts", "workspace": "api" }`. Omitting it targets the primary workspace. An unknown name fails with `unknown workspace "X". Available: ...`.
 - `workspace_list` (read-only) shows every workspace: name, absolute path, `(primary)` marker, whether `<root>/.workspace-mcp` exists, and the active change id when `state.json` exists.
@@ -225,9 +292,12 @@ Secure MCP Tunnel: `scripts/tunnel.sh` supports `--workspace <name>=<path>` (rep
 scripts/tunnel.sh --shell \
   --root /path/to/project \
   --workspace api=/path/to/other-project
+
+# or drive everything from a config file
+scripts/tunnel.sh --config /path/to/workspace-mcp.config.json
 ```
 
-If `--root` is omitted, the first `--workspace` becomes the primary. The profile's `mcp-command` is passed straight to the server, so you can also extend it by hand:
+If `--root` is omitted, the first `--workspace` becomes the primary. The script validates that the `--config` file exists before generating the tunnel profile. The profile's `mcp-command` is passed straight to the server, so you can also extend it by hand:
 
 ```yaml
 # ~/.config/tunnel-client/workspace-mcp.yaml
@@ -261,7 +331,7 @@ This blocks `../../etc/passwd`, absolute paths such as `/etc/passwd`, and symlin
 
 Other deliberate restrictions:
 
-- **No command execution unless you opt in.** With no `--shell`/`--shell-any` flag and no shell env vars, `run_command` is not registered and `tools/list` exposes exactly nineteen tools: the six filesystem tools plus `workspace_list`, `work_log`, `remember`, `recall`, `git_status`, `git_diff` and the seven change tools. When enabled, read the dedicated subsection below.
+- **No command execution unless you opt in.** With no `--shell`/`--shell-any` flag, no shell env vars and no config `shell.mode`, `run_command` is not registered and `tools/list` exposes exactly nineteen tools: the six filesystem tools plus `workspace_list`, `work_log`, `remember`, `recall`, `git_status`, `git_diff` and the seven change tools. When enabled, read the dedicated subsection below. A config `shell.deny` list is enforced in every mode.
 - Binary files (NUL byte within the first 8 KiB) cannot be read or searched; `list_files` omits them.
 - `.git`, `node_modules`, `.cache` and `.workspace-mcp` directories are skipped by `grep` and `list_files`.
 - Symbolic links are never followed during directory traversal (prevents loops and escape).
@@ -273,19 +343,21 @@ Other deliberate restrictions:
 
 `run_command` exists so an agent can run tests, linters, builds and commands such as `git status` in the workspace. Be honest about what it is: an allowlist is a guardrail against casual or accidental execution, **NOT a sandbox**.
 
-- **Off by default.** Without `--shell`, `--shell-any` or the `WORKSPACE_MCP_SHELL` env vars, the tool is not registered at all.
+- **Off by default.** Without `--shell`, `--shell-any`, the `WORKSPACE_MCP_SHELL` env vars or a config `shell.mode`, the tool is not registered at all.
 - **No shell parsing.** The command is an argv array executed with `spawn(..., { shell: false })`. Pipes (`|`), `&&`, redirection (`>`), `$VAR` expansion and globs are passed as literal arguments and are never interpreted - that is the whole point.
-- **The allowlist is not containment.** In allowlist mode the executable name (`path.basename(command[0])`) must be in the allowlist (`pnpm`, `npm`, `npx`, `node` by default; extend with `--shell-allow` or `WORKSPACE_MCP_SHELL_ALLOW`). But `node -e`, `npx` and package scripts can execute arbitrary code, so every allowlisted entry already implies arbitrary-code execution. `--shell-any` skips the check entirely and prints a loud warning to stderr.
+- **The allowlist is not containment.** In allowlist mode the executable name (`path.basename(command[0])`) must be in the allowlist (`pnpm`, `npm`, `npx`, `node` by default; extend with `--shell-allow`, `WORKSPACE_MCP_SHELL_ALLOW` or config `shell.allow`). But `node -e`, `npx` and package scripts can execute arbitrary code, so every allowlisted entry already implies arbitrary-code execution. `--shell-any` skips the check entirely and prints a loud warning to stderr.
+- **Deny always wins.** A config `shell.deny` (or `WORKSPACE_MCP_SHELL_DENY`) list is checked before the allowlist in both modes, and no flag can remove it: the command fails with `command denied by configuration: <name>`.
 - **Same OS permissions.** The child runs with your OS user's permissions. `cwd` is confined to the workspace root, but the process itself can reach anything your user can.
 - **Environment scrubbing.** `CONTROL_PLANE_API_KEY`, `OPENAI_API_KEY`, `OPENAI_ADMIN_KEY` and `MCP_TOKEN` are removed from the child environment; `NO_COLOR=1` and `FORCE_COLOR=0` are set.
-- **Timeouts kill the process group.** Default 120 s, max 600 s. On timeout the whole group receives `SIGTERM`, then `SIGKILL` after a 3 s grace period.
+- **Timeouts kill the process group.** Default 120 s (config `shell.timeoutMs` changes the default), max 600 s. On timeout the whole group receives `SIGTERM`, then `SIGKILL` after a 3 s grace period.
 - **Output is bounded.** stdout and stderr are merged (best effort, arrival order), ANSI escape codes are stripped, and above 256 KiB only the first 32 KiB and the last 32 KiB are kept - the tail is where test failures print.
 - **ChatGPT asks for confirmation per call.** The tool is annotated `readOnlyHint: false`, `destructiveHint: true`, `openWorldHint: true`, so ChatGPT requests approval for every invocation; it cannot be made read-only because it is not.
 
 How to enable:
 
 - Local / ChatGPT desktop (Work) / Codex config (`~/.codex/config.toml`): append `--shell` (allowlist) or `--shell-any` (unrestricted) to the server args, e.g. `args = ["/path/to/workspace-mcp/dist/index.js", "--root", "/path/to/project", "--shell"]`.
-- ChatGPT chat through Secure MCP Tunnel: `scripts/tunnel.sh --root /path --shell` or `--shell-any`. The script exports `WORKSPACE_MCP_SHELL=1` / `WORKSPACE_MCP_SHELL_MODE=any` before `exec tunnel-client run`, and the daemon child inherits them.
+- Config file: put `{ "shell": { "mode": "allowlist" } }` in `workspace-mcp.config.json` (or the global path) and start the server with no shell flags. See [Configuration file](#configuration-file).
+- ChatGPT chat through Secure MCP Tunnel: `scripts/tunnel.sh --root /path --shell` or `--shell-any`, or point it at a config file with `scripts/tunnel.sh --config /path/to/workspace-mcp.config.json`. The script exports `WORKSPACE_MCP_SHELL=1` / `WORKSPACE_MCP_SHELL_MODE=any` before `exec tunnel-client run`, and the daemon child inherits them.
 
 ### Long-running commands (jobs)
 
@@ -419,10 +491,10 @@ The full view also shows each stage document present or missing with its byte si
 | `list_files` depth | default 6, cap 12 |
 | Binary detection window | first 8 KiB |
 | Ignored directories | `.git`, `node_modules`, `.cache`, `.workspace-mcp` |
-| `run_command` timeout | default 120000 ms, min 1000 ms, max 600000 ms |
+| `run_command` timeout | default 120000 ms (config `shell.timeoutMs` overrides), min 1000 ms, max 600000 ms |
 | `run_command` captured output | 256 KiB before collapsing to first 32 KiB + last 32 KiB |
 | `run_command` kill grace | 3 s between `SIGTERM` and `SIGKILL` |
-| `start_job` max runtime | default 1800000 ms, min 1000 ms, max 7200000 ms |
+| `start_job` max runtime | default 1800000 ms (config `shell.maxRuntimeMs` overrides), min 1000 ms, max 7200000 ms |
 | `start_job` log per job | 64 MiB hard cap, then output is discarded and flagged |
 | `job_status` tail | default 8192 bytes, cap 262144 bytes |
 | `job_status` list without `jobId` | 20 most recent jobs |
