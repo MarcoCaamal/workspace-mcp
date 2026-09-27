@@ -4,6 +4,7 @@ import { HARNESS_STAGES, HarnessStoreError, buildContinuationEnvelope, type Harn
 import type { WorkspaceRegistry } from "../workspaces.js";
 import {
   filterEnrichedLines,
+  renderBootstrapBlock,
   renderCheckpointLines,
   renderContinuationLines,
   renderHarnessRecall,
@@ -119,11 +120,23 @@ export function registerSessionTools(
       try {
         const { root } = registry.resolve(workspace);
         const session = store.startSession(root);
+        // Slice D bootstrap (change harness-operability): a fresh session has
+        // no works and no checkpoint, so the block renders untruncated with
+        // the initial next action. Appended after the token line so the first
+        // line stays the opaque session token.
+        const block = renderBootstrapBlock({
+          sessionId: session.id,
+          primaryWorkspace: session.primaryWorkspace,
+          works: [],
+          latestSummary: null,
+          next: "explore",
+        });
         return textResult(
           [
             session.id,
             `primaryWorkspace: ${session.primaryWorkspace}`,
             `binding: session ${session.id} bound to ${session.primaryWorkspace}`,
+            block,
           ].join("\n"),
         );
       } catch (error) {
@@ -233,6 +246,19 @@ export function registerSessionTools(
         } else {
           lines.push("next: explore");
         }
+        // Slice D bootstrap (change harness-operability): append the capped
+        // block carrying every work in the session plus the latest summary
+        // and the derived next action. The JSON continuation above is
+        // unaffected; `next` here reuses the single store derivation.
+        lines.push(
+          renderBootstrapBlock({
+            sessionId: resumed.session.id,
+            primaryWorkspace: resumed.session.primaryWorkspace,
+            works: store.listWorks(session),
+            latestSummary: resumed.latestCheckpoint?.summary ?? null,
+            next: status.next,
+          }),
+        );
         return textResult(lines.join("\n"));
       } catch (error) {
         return errorResult(harnessErrorText(error));
