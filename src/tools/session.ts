@@ -1,9 +1,11 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { HARNESS_STAGES, HarnessStoreError, type HarnessStore } from "../session-store.js";
+import { HARNESS_STAGES, HarnessStoreError, buildContinuationEnvelope, type HarnessStore } from "../session-store.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
 import {
   filterEnrichedLines,
+  renderCheckpointLines,
+  renderContinuationLines,
   renderHarnessRecall,
   type RecallEnricher,
   type RecallEnrichedLine,
@@ -67,6 +69,20 @@ const artifactIdSchema = z
   .min(1)
   .max(200)
   .describe("External stored stage-artifact id returned by stage_write. Never a repo-local path.");
+
+/**
+ * Slice C continuation (change harness-operability): opt-in output shape for
+ * `harness_status` and `session_resume`. The default `text` path renders
+ * byte-identical output to pre-change behavior; explicit `"json"` returns the
+ * versioned capped envelope built from the single `store.harnessStatus()`
+ * derivation — never a second or third derivation path.
+ */
+const continuationFormatSchema = z
+  .enum(["text", "json"])
+  .default("text")
+  .describe(
+    'Output shape: "text" renders the default human-readable lines, "json" returns the versioned continuation envelope.',
+  );
 
 function harnessErrorText(error: unknown): string {
   if (error instanceof HarnessStoreError) {
@@ -187,12 +203,19 @@ export function registerSessionTools(
       inputSchema: {
         session: sessionTokenSchema,
         work: optionalWorkTokenSchema,
+        format: continuationFormatSchema,
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ session, work }) => {
+    async ({ session, work, format }) => {
       try {
         const resumed = store.resume(session, work);
+        // Single derivation: the store owns next/reason for both text and
+        // json, so resume can never diverge from status for the same state.
+        const status = store.harnessStatus(session, work);
+        if (format === "json") {
+          return textResult(JSON.stringify(buildContinuationEnvelope(status), null, 2));
+        }
         const lines = [
           `session: ${resumed.session.id}`,
           `primaryWorkspace: ${resumed.session.primaryWorkspace}`,
@@ -204,14 +227,11 @@ export function registerSessionTools(
             `changeId: ${resumed.work.changeId ?? "(unbound)"}`,
           );
         }
+        lines.push(...renderCheckpointLines(resumed.latestCheckpoint));
         if (resumed.latestCheckpoint !== null) {
-          lines.push(
-            `latestCheckpoint: seq ${resumed.latestCheckpoint.seq} stage ${resumed.latestCheckpoint.completedStage}`,
-            `summary: ${resumed.latestCheckpoint.summary}`,
-            `next: ${deriveNext(resumed.latestCheckpoint.completedStage).next}`,
-          );
+          lines.push(`next: ${status.next}`);
         } else {
-          lines.push("latestCheckpoint: (none)", "next: explore");
+          lines.push("next: explore");
         }
         return textResult(lines.join("\n"));
       } catch (error) {
@@ -346,27 +366,22 @@ export function registerSessionTools(
       inputSchema: {
         session: sessionTokenSchema,
         work: optionalWorkTokenSchema,
+        format: continuationFormatSchema,
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ session, work }) => {
+    async ({ session, work, format }) => {
       try {
         const status = store.harnessStatus(session, work);
+        if (format === "json") {
+          return textResult(JSON.stringify(buildContinuationEnvelope(status), null, 2));
+        }
         const lines = [
           `session: ${session}`,
-          `currentStage: ${status.currentStage ?? "(none)"}`,
-          `next: ${status.next}`,
-          `reason: ${status.reason}`,
+          ...renderContinuationLines(status),
           `unverified: ${status.unverified}`,
+          ...renderCheckpointLines(status.latestCheckpoint),
         ];
-        if (status.latestCheckpoint !== null) {
-          lines.push(
-            `latestCheckpoint: seq ${status.latestCheckpoint.seq} stage ${status.latestCheckpoint.completedStage}`,
-            `summary: ${status.latestCheckpoint.summary}`,
-          );
-        } else {
-          lines.push("latestCheckpoint: (none)");
-        }
         return textResult(lines.join("\n"));
       } catch (error) {
         return errorResult(harnessErrorText(error));
@@ -392,26 +407,6 @@ export function registerSessionTools(
   }
   const resumed = store.resume(sessionId, workId);
   return resumed.work?.workspace ?? resumed.session.primaryWorkspace;
-}
-
-/**
- * Minimal next-action derivation for the `session_resume` summary line. The
- * full derivation (unverified transitions, bypass reasons) lives in
- * `store.harnessStatus()`; this stays minimal so resume output stays compact.
- */
-function deriveNext(completedStage: string): { next: string; reason: string } {
-  const index = (HARNESS_STAGES as readonly string[]).indexOf(completedStage);
-  if (index === -1) {
-    return {
-      next: "explore",
-      reason: `unknown completed stage ${completedStage}; restart from explore`,
-    };
-  }
-  const next = HARNESS_STAGES[index + 1];
-  if (next === undefined) {
-    return { next: "complete", reason: "verify checkpointed; work is complete" };
-  }
-  return { next, reason: `${completedStage} checkpointed; continue with ${next}` };
 }
 
 const recallQuerySchema = z

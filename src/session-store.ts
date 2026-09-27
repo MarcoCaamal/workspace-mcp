@@ -71,6 +71,119 @@ export const HARNESS_STAGES = [
 
 export type HarnessStage = (typeof HARNESS_STAGES)[number];
 
+/**
+ * Slice C continuation (change harness-operability): single-source per-stage
+ * contract table co-located with the canonical ordered stage list. Each stage
+ * maps to the operator actions (real registered harness tool names) allowed
+ * there plus the artifact that records the stage outcome. A drift test in
+ * `test/harness-wiring.test.ts` asserts the keys equal `HARNESS_STAGES`
+ * exactly and every named action is a registered tool, so tool-surface
+ * changes without a table update fail the suite. The envelope carries
+ * actions only, never measured compliance or metric values.
+ */
+export const HARNESS_STAGE_CONTRACTS: Record<
+  HarnessStage,
+  { readonly allowedActions: readonly string[]; readonly artifact: string }
+> = {
+  explore: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status"],
+    artifact: "exploration note",
+  },
+  propose: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status"],
+    artifact: "proposal",
+  },
+  spec: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status"],
+    artifact: "delta specs",
+  },
+  design: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status"],
+    artifact: "design",
+  },
+  tasks: {
+    allowedActions: ["task_write", "stage_write", "checkpoint", "harness_status"],
+    artifact: "task list",
+  },
+  apply: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status"],
+    artifact: "apply record",
+  },
+  verify: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status", "session_end"],
+    artifact: "verification report",
+  },
+};
+
+/** Version of the opt-in JSON continuation envelope (Slice C). */
+export const CONTINUATION_ENVELOPE_VERSION = 1 as const;
+
+/** Cap for the checkpoint summary embedded in the JSON envelope. */
+export const CONTINUATION_CHECKPOINT_SUMMARY_MAX_CHARS = 2000;
+
+/**
+ * Opt-in machine-readable continuation payload (Slice C). Carries `next`,
+ * `reason`, the per-stage allowed-actions table, and a capped checkpoint
+ * reference — and NO metric values. Built from the single
+ * `store.harnessStatus()` derivation, so `json` stays consistent with the
+ * default `text` output by construction.
+ */
+export interface ContinuationEnvelope {
+  version: 1;
+  next: string;
+  reason: string;
+  perStage: Array<{ stage: string; allowedActions: string[]; artifact: string }>;
+  latestCheckpoint: {
+    seq: number;
+    completedStage: string;
+    artifactId: string;
+    summary: string;
+    truncated: boolean;
+  } | null;
+}
+
+/**
+ * Shapes a `harnessStatus()` result into the versioned capped JSON envelope.
+ * Oversized checkpoint summaries are truncated with an explicit
+ * `… [truncated N chars]` marker (never a silent mid-JSON cut) so the
+ * payload stays well-formed and parseable.
+ */
+export function buildContinuationEnvelope(status: HarnessStatusResult): ContinuationEnvelope {
+  const checkpoint = status.latestCheckpoint;
+  return {
+    version: CONTINUATION_ENVELOPE_VERSION,
+    next: status.next,
+    reason: status.reason,
+    perStage: (HARNESS_STAGES as readonly HarnessStage[]).map((stage) => ({
+      stage,
+      allowedActions: [...HARNESS_STAGE_CONTRACTS[stage].allowedActions],
+      artifact: HARNESS_STAGE_CONTRACTS[stage].artifact,
+    })),
+    latestCheckpoint:
+      checkpoint === null
+        ? null
+        : {
+            seq: checkpoint.seq,
+            completedStage: checkpoint.completedStage,
+            artifactId: checkpoint.artifactId,
+            summary: capCheckpointSummary(checkpoint.summary).text,
+            truncated: capCheckpointSummary(checkpoint.summary).truncated,
+          },
+  };
+}
+
+/** Caps an embedded checkpoint summary with an explicit truncation marker. */
+function capCheckpointSummary(summary: string): { text: string; truncated: boolean } {
+  if (summary.length <= CONTINUATION_CHECKPOINT_SUMMARY_MAX_CHARS) {
+    return { text: summary, truncated: false };
+  }
+  const removed = summary.length - CONTINUATION_CHECKPOINT_SUMMARY_MAX_CHARS;
+  return {
+    text: `${summary.slice(0, CONTINUATION_CHECKPOINT_SUMMARY_MAX_CHARS)}… [truncated ${removed} chars]`,
+    truncated: true,
+  };
+}
+
 /** Recall/hardening bounds (Slice 3, task 4.5 decision record). */
 export const MAX_STAGE_BODY_CHARS = 100000;
 export const MAX_TASK_BODY_CHARS = 100000;
