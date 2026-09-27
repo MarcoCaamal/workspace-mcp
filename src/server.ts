@@ -21,6 +21,19 @@ import { WorkspaceRegistry, type WorkspaceConfig } from "./workspaces.js";
 export const SERVER_NAME = "workspace-mcp";
 export const FALLBACK_VERSION = "0.0.0";
 
+/**
+ * Slice B metrics boundary (change harness-operability, design open
+ * question): the single static sentence that lets the model redirect a chat
+ * metrics request to the operator without ever carrying a value. It names
+ * categories only — no tool, no values, no query syntax — and is asserted by
+ * `test/harness-wiring.test.ts` to be the only `metric*` text in the
+ * instructions. Wording adopted verbatim from design at Slice B apply; flag
+ * in review if it must change.
+ */
+export const METRICS_BOUNDARY_SENTENCE =
+  "Harness health signals are operator-local: never report coverage, cadence, " +
+  "hygiene, or rework figures in chat; redirect such requests to Marco.";
+
 export interface CreateServerOptions {
   /** Named workspace roots. Each tool resolves one of them per call. */
   workspaces: WorkspaceConfig[];
@@ -122,6 +135,7 @@ export function buildInstructions(
       "- Bearer and token-possession semantics: the shared HTTP bearer gates transport access only. Within an authenticated tunnel, possession of a session/work token controls that session; there is no per-caller identity and no stronger conversation-isolation claim.",
       "- New harness state (sessions, works, stage artifacts, task bodies, checkpoints, summaries) lives only in the outside-repo store; stage progression creates no repo-local files. The legacy tools above still write repo-local state under <root>/.workspace-mcp/ and serve the legacy flow only.",
       "- Harness stages in order: explore, propose, spec, design, tasks, apply, verify. harness_status derives the next action from the external store; a stage artifact without a checkpoint is flagged unverified (honest, never a gate). Out-of-order checkpoints are permitted and recorded.",
+      `- ${METRICS_BOUNDARY_SENTENCE}`,
       "- Jobs do not survive a server restart: after a restart every pre-restart job id reports unknown job id, while session/work/stage state resumes from the store by explicit token.",
       "",
     );
