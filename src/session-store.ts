@@ -80,6 +80,83 @@ export const MAX_RECALL_LIMIT = 50;
 /** Ended sessions older than this are eligible for explicit purge. */
 export const SESSION_RETENTION_DAYS = 90;
 
+/**
+ * Slice A envelope (change harness-operability): versioned single-line
+ * HTML-comment header carried inline in `stage_artifacts.body`.
+ *
+ * Delimiter wording is a compatibility surface, recorded at Slice A apply:
+ * `<!-- harness-envelope v1 stage="…" sessionId="…" workId="…" artifactId="…"
+ * createdAt="…" bodyLength="…" -->`. `bodyLength` counts free-body characters
+ * only (header excluded). Parsing never throws: any unknown or malformed
+ * first line falls back to the full stored text with `header: null`, trusting
+ * no header field. `bodyLength` is descriptive metadata and is not
+ * re-validated on parse; row columns stay authoritative for identity.
+ */
+export const ENVELOPE_VERSION = 1 as const;
+
+export interface EnvelopeHeader {
+  stage: string;
+  sessionId: string;
+  workId: string;
+  artifactId: string;
+  createdAt: string;
+  bodyLength: number;
+}
+
+const ENVELOPE_PATTERN =
+  /^<!-- harness-envelope v1 stage="([^"]*)" sessionId="([^"]*)" workId="([^"]*)" artifactId="([^"]*)" createdAt="([^"]*)" bodyLength="(\d+)" -->$/;
+
+/** Prepends the versioned header line to a free body (header excluded from `bodyLength`). */
+export function emitEnvelope(
+  header: Omit<EnvelopeHeader, "bodyLength">,
+  body: string,
+): string {
+  const firstLine =
+    `<!-- harness-envelope v${ENVELOPE_VERSION} stage="${header.stage}" ` +
+    `sessionId="${header.sessionId}" workId="${header.workId}" ` +
+    `artifactId="${header.artifactId}" createdAt="${header.createdAt}" ` +
+    `bodyLength="${body.length}" -->`;
+  return `${firstLine}\n${body}`;
+}
+
+/**
+ * Splits stored text into header + free body. Malformed or unknown first
+ * lines (including pre-change bodies with no header) return the full stored
+ * text with `header: null`.
+ */
+export function parseEnvelope(stored: string):
+  | { header: EnvelopeHeader; body: string }
+  | { header: null; body: string } {
+  const newline = stored.indexOf("\n");
+  const firstLine = (newline === -1 ? stored : stored.slice(0, newline)).replace(/\r$/, "");
+  const match = ENVELOPE_PATTERN.exec(firstLine);
+  if (match === null) {
+    return { header: null, body: stored };
+  }
+  const [, stage, sessionId, workId, artifactId, createdAt, rawLength] = match;
+  if (
+    stage === undefined ||
+    sessionId === undefined ||
+    workId === undefined ||
+    artifactId === undefined ||
+    createdAt === undefined ||
+    rawLength === undefined
+  ) {
+    return { header: null, body: stored };
+  }
+  return {
+    header: {
+      stage,
+      sessionId,
+      workId,
+      artifactId,
+      createdAt,
+      bodyLength: Number(rawLength),
+    },
+    body: newline === -1 ? "" : stored.slice(newline + 1),
+  };
+}
+
 export type HarnessStoreErrorCode =
   | "unknown-session"
   | "closed-session"
@@ -391,7 +468,9 @@ function toStageArtifactRecord(row: StageArtifactRow): StageArtifactRecord {
     workspace: row.workspace,
     changeId: row.change_id,
     stage: row.stage,
-    body: row.body,
+    // Slice A: stored text may carry the envelope header; recall surfaces the
+    // free body. Pre-change rows without a header pass through untouched.
+    body: parseEnvelope(row.body).body,
     createdAt: row.created_at,
   };
 }
@@ -812,6 +891,18 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           body: input.body,
           createdAt: now(),
         };
+        // Slice A: persist the versioned envelope header inline; the record
+        // keeps the free body while the stored bytes carry header + body.
+        const storedBody = emitEnvelope(
+          {
+            stage: record.stage,
+            sessionId: record.sessionId,
+            workId: record.workId,
+            artifactId: record.id,
+            createdAt: record.createdAt,
+          },
+          input.body,
+        );
         requireOpen()
           .prepare(
             "INSERT INTO stage_artifacts(id, session_id, work_id, workspace, change_id, stage, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -823,7 +914,7 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
             record.workspace,
             record.changeId,
             record.stage,
-            record.body,
+            storedBody,
             record.createdAt,
           );
         return record;
@@ -874,7 +965,9 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           workspace: row.workspace,
           changeId: row.change_id,
           stage: row.stage,
-          body: row.body,
+          // Slice A: strip the envelope header on read; pre-change rows
+          // without a header read as full text. Columns stay authoritative.
+          body: parseEnvelope(row.body).body,
           createdAt: row.created_at,
         };
       } catch (error) {

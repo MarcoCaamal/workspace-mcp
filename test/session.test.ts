@@ -3,15 +3,19 @@ import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "../src/server.js";
 import {
+  ENVELOPE_VERSION,
   HARNESS_STAGES,
   HarnessStoreError,
+  emitEnvelope,
   openHarnessStore,
+  parseEnvelope,
   type HarnessStore,
 } from "../src/session-store.js";
 
@@ -157,6 +161,41 @@ describe("harness session store foundation", () => {
     const read = active().readStageArtifact(artifact.id, { sessionId: session.id });
     expect(read.body).toBe(body);
     expect(read.stage).toBe("propose");
+  });
+
+  it("persists the versioned envelope header inline while reading back the free body", () => {
+    const session = active().startSession(rootA);
+    const work = active().startWork(session.id, rootA, "change-1");
+    const body = "# Proposal\n\nEnvelope wiring check.";
+    const artifact = active().writeStageArtifact({
+      sessionId: session.id,
+      workId: work.id,
+      workspace: rootA,
+      changeId: "change-1",
+      stage: "propose",
+      body,
+    });
+    const db = new DatabaseSync(dbPath);
+    try {
+      const row = db
+        .prepare("SELECT body FROM stage_artifacts WHERE id = ?")
+        .get(artifact.id) as { body: string };
+      const parsed = parseEnvelope(row.body);
+      expect(parsed.header).toMatchObject({
+        stage: "propose",
+        sessionId: session.id,
+        workId: work.id,
+        artifactId: artifact.id,
+        createdAt: artifact.createdAt,
+        bodyLength: body.length,
+      });
+      expect(parsed.body).toBe(body);
+    } finally {
+      db.close();
+    }
+    expect(active().readStageArtifact(artifact.id, { sessionId: session.id }).body).toBe(
+      body,
+    );
   });
 
   it("rejects unknown stage names with the valid list", () => {
@@ -1005,5 +1044,123 @@ describe("harness transport identity", () => {
     } finally {
       await closeTurn(turn);
     }
+  });
+});
+
+/**
+ * Slice A envelope (change harness-operability, tasks A.1): versioned
+ * single-line HTML-comment header emitted at `stage_write` and parsed at
+ * `readStageArtifact`, with tolerant fallback to plain text.
+ *
+ * Delimiter choice (recorded at apply, design open question): the exact
+ * single-line form from design —
+ * `<!-- harness-envelope v1 stage="…" sessionId="…" workId="…" artifactId="…"
+ * createdAt="…" bodyLength="…" -->` — is the compatibility surface.
+ */
+describe("harness stage-artifact envelope (pure emit/parse)", () => {
+  it("round-trips all six header fields with bodyLength excluding the header", () => {
+    const body = "# Design\n\nFree-form markdown body.";
+    const stored = emitEnvelope(
+      {
+        stage: "design",
+        sessionId: "11111111-1111-4111-8111-111111111111",
+        workId: "22222222-2222-4222-8222-222222222222",
+        artifactId: "33333333-3333-4333-8333-333333333333",
+        createdAt: "2026-09-26T00:00:00.000Z",
+      },
+      body,
+    );
+    expect(ENVELOPE_VERSION).toBe(1);
+    const parsed = parseEnvelope(stored);
+    expect(parsed.header).not.toBeNull();
+    expect(parsed.header).toMatchObject({
+      stage: "design",
+      sessionId: "11111111-1111-4111-8111-111111111111",
+      workId: "22222222-2222-4222-8222-222222222222",
+      artifactId: "33333333-3333-4333-8333-333333333333",
+      createdAt: "2026-09-26T00:00:00.000Z",
+      bodyLength: body.length,
+    });
+    expect(parsed.body).toBe(body);
+    expect(parsed.header?.bodyLength).toBeLessThan(stored.length);
+  });
+
+  it("emits a single versioned HTML-comment first line", () => {
+    const stored = emitEnvelope(
+      {
+        stage: "spec",
+        sessionId: "s",
+        workId: "w",
+        artifactId: "a",
+        createdAt: "2026-09-26T00:00:00.000Z",
+      },
+      "body text",
+    );
+    const [firstLine, ...rest] = stored.split("\n");
+    expect(firstLine).toMatch(/^<!-- harness-envelope v1 .* -->$/);
+    expect(rest.join("\n")).toBe("body text");
+  });
+
+  it("round-trips multiline and empty bodies byte-identically", () => {
+    const multiline = "line one\n\nline two\n```\ncode\n```\n";
+    const parsedMulti = parseEnvelope(
+      emitEnvelope(
+        {
+          stage: "tasks",
+          sessionId: "s",
+          workId: "w",
+          artifactId: "a",
+          createdAt: "2026-09-26T00:00:00.000Z",
+        },
+        multiline,
+      ),
+    );
+    expect(parsedMulti.body).toBe(multiline);
+    expect(parsedMulti.header?.bodyLength).toBe(multiline.length);
+
+    const parsedEmpty = parseEnvelope(
+      emitEnvelope(
+        {
+          stage: "tasks",
+          sessionId: "s",
+          workId: "w",
+          artifactId: "a",
+          createdAt: "2026-09-26T00:00:00.000Z",
+        },
+        "",
+      ),
+    );
+    expect(parsedEmpty.body).toBe("");
+    expect(parsedEmpty.header?.bodyLength).toBe(0);
+  });
+
+  it("treats pre-change bodies with no header as full free text", () => {
+    const legacy = "# Proposal\n\nBody bytes live in the store.";
+    const parsed = parseEnvelope(legacy);
+    expect(parsed.header).toBeNull();
+    expect(parsed.body).toBe(legacy);
+  });
+
+  it("trusts no header field when the first line is malformed", () => {
+    const malformed =
+      `<!-- harness-envelope v1 stage="design" sessionId="s" -->\nReal body.`;
+    const parsed = parseEnvelope(malformed);
+    expect(parsed.header).toBeNull();
+    expect(parsed.body).toBe(malformed);
+  });
+
+  it("falls back to full text on an unknown envelope version", () => {
+    const future =
+      `<!-- harness-envelope v2 stage="design" sessionId="s" workId="w" artifactId="a" createdAt="t" bodyLength="9" -->\nReal body.`;
+    const parsed = parseEnvelope(future);
+    expect(parsed.header).toBeNull();
+    expect(parsed.body).toBe(future);
+  });
+
+  it("falls back to full text when free text merely resembles a header", () => {
+    const lookalike = `<!-- harness-envelope v1 -->\nReal body.`;
+    const parsed = parseEnvelope(lookalike);
+    expect(parsed.header).toBeNull();
+    expect(parsed.body).toBe(lookalike);
   });
 });
