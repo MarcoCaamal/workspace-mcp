@@ -10,6 +10,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "../src/server.js";
 import {
+  BOOTSTRAP_MAX_CHARS,
+  BOOTSTRAP_SUMMARY_MAX_CHARS,
   ENVELOPE_VERSION,
   HARNESS_STAGES,
   HarnessStoreError,
@@ -18,6 +20,7 @@ import {
   parseEnvelope,
   type HarnessStore,
 } from "../src/session-store.js";
+import { renderBootstrapBlock } from "../src/tools/recall.js";
 
 /**
  * Store foundation (change chatgpt-workspace-harness, task 2.3).
@@ -1162,5 +1165,279 @@ describe("harness stage-artifact envelope (pure emit/parse)", () => {
     const parsed = parseEnvelope(lookalike);
     expect(parsed.header).toBeNull();
     expect(parsed.body).toBe(lookalike);
+  });
+});
+
+/**
+ * Slice D bootstrap (change harness-operability, task D.1 RED).
+ *
+ * Pure-renderer tests for `renderBootstrapBlock`: the whole block stays
+ * within `BOOTSTRAP_MAX_CHARS`, the embedded summary within
+ * `BOOTSTRAP_SUMMARY_MAX_CHARS` with an explicit truncation marker, small
+ * sessions render complete with no marker, and the block carries the session
+ * id, primary workspace, works, latest summary, next action, and the static
+ * bilingual trigger hints.
+ */
+describe("slice D bootstrap block (pure capped renderer)", () => {
+  it("pins the bootstrap caps beside the existing store caps", () => {
+    expect(BOOTSTRAP_MAX_CHARS).toBe(2000);
+    expect(BOOTSTRAP_SUMMARY_MAX_CHARS).toBe(500);
+  });
+
+  it("renders a small session complete with no truncation marker", () => {
+    const block = renderBootstrapBlock({
+      sessionId: "11111111-1111-4111-8111-111111111111",
+      primaryWorkspace: "/tmp/root-a",
+      works: [{ id: "22222222-2222-4222-8222-222222222222", changeId: "change-1" }],
+      latestSummary: "spec checkpoint summary",
+      next: "design",
+    });
+    expect(block.length).toBeLessThanOrEqual(BOOTSTRAP_MAX_CHARS);
+    expect(block).toContain("session: 11111111-1111-4111-8111-111111111111");
+    expect(block).toContain("primaryWorkspace: /tmp/root-a");
+    expect(block).toContain("22222222-2222-4222-8222-222222222222");
+    expect(block).toContain("change-1");
+    expect(block).toContain("spec checkpoint summary");
+    expect(block).toContain("next: design");
+    expect(block).not.toMatch(/… \[truncated \d+ chars\]/);
+  });
+
+  it("caps an oversized summary at 500 chars with an explicit marker", () => {
+    const summary = "s".repeat(1200);
+    const block = renderBootstrapBlock({
+      sessionId: "s",
+      primaryWorkspace: "/tmp/root-a",
+      works: [],
+      latestSummary: summary,
+      next: "explore",
+    });
+    expect(block.length).toBeLessThanOrEqual(BOOTSTRAP_MAX_CHARS);
+    expect(block).toContain(`… [truncated 700 chars]`);
+    const summaryLine = block
+      .split("\n")
+      .find((line) => line.startsWith("latestSummary: "));
+    expect(summaryLine).toBeDefined();
+    expect(summaryLine!.length).toBeLessThanOrEqual(
+      "latestSummary: ".length + BOOTSTRAP_SUMMARY_MAX_CHARS + "… [truncated 700 chars]".length,
+    );
+    expect(summaryLine).toContain("s".repeat(BOOTSTRAP_SUMMARY_MAX_CHARS));
+  });
+
+  it("caps the whole block at 2000 chars with an explicit marker", () => {
+    const works = Array.from({ length: 60 }, (_, index) => ({
+      id: `work-${index}-22222222-2222-4222-8222-222222222222`,
+      changeId: `change-${index}`,
+    }));
+    const block = renderBootstrapBlock({
+      sessionId: "s",
+      primaryWorkspace: "/tmp/root-a",
+      works,
+      latestSummary: "short summary",
+      next: "explore",
+    });
+    expect(block.length).toBeLessThanOrEqual(BOOTSTRAP_MAX_CHARS);
+    expect(block).toMatch(/… \[truncated \d+ chars\]/);
+  });
+
+  it("renders empty works and a missing summary without a marker", () => {
+    const block = renderBootstrapBlock({
+      sessionId: "s",
+      primaryWorkspace: "/tmp/root-a",
+      works: [],
+      latestSummary: null,
+      next: "explore",
+    });
+    expect(block).toContain("works: (none)");
+    expect(block).toContain("latestSummary: (none)");
+    expect(block).not.toMatch(/… \[truncated \d+ chars\]/);
+  });
+
+  it("carries the static bilingual natural-trigger hints", () => {
+    const block = renderBootstrapBlock({
+      sessionId: "s",
+      primaryWorkspace: "/tmp/root-a",
+      works: [],
+      latestSummary: null,
+      next: "explore",
+    });
+    expect(block).toContain("nuevo trabajo");
+    expect(block).toContain("work_start");
+    expect(block).toContain("continúa la sesión anterior");
+    expect(block).toContain("session_resume");
+  });
+});
+
+/**
+ * Slice D bootstrap wiring (change harness-operability, task D.3 RED).
+ *
+ * `session_start` and `session_resume` append the capped block from
+ * `renderBootstrapBlock` to their existing text output (JSON continuation
+ * from Slice C unaffected). A tokenless turn carrying trigger-like text
+ * still attaches to nothing.
+ */
+describe("slice D bootstrap block on start/resume", () => {
+  let sandbox: string;
+  let rootA: string;
+  let dbPath: string;
+
+  interface HarnessClient {
+    client: Client;
+    server: McpServer;
+  }
+
+  interface ToolResponse {
+    text: string;
+    isError: boolean;
+  }
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(path.join(tmpdir(), "workspace-mcp-bootstrap-"));
+    rootA = path.join(sandbox, "root-a");
+    await mkdir(rootA, { recursive: true });
+    dbPath = path.join(sandbox, "harness.db");
+  });
+
+  afterEach(async () => {
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  async function connectWithHarness(): Promise<HarnessClient> {
+    const store = openHarnessStore({ dbPath, workspaceRoots: [rootA] });
+    store.open();
+    const server = (createServer as (...args: unknown[]) => McpServer)({
+      workspaces: [{ name: "alpha", path: rootA }],
+      defaultWorkspace: "alpha",
+      version: "test",
+      harness: { session: true, store },
+    } as unknown);
+    const client = new Client({ name: "workspace-mcp-bootstrap-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    (server as unknown as { __harnessStore?: HarnessStore }).__harnessStore = store;
+    return { client, server };
+  }
+
+  async function closeHarness(session: HarnessClient): Promise<void> {
+    await session.client.close().catch(() => undefined);
+    await session.server.close().catch(() => undefined);
+    (session.server as unknown as { __harnessStore?: HarnessStore }).__harnessStore?.close();
+  }
+
+  async function callTool(
+    session: HarnessClient,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<ToolResponse> {
+    const result = await session.client.callTool({ name, arguments: args });
+    const content = (result.content ?? []) as Array<{ type: string; text?: string }>;
+    const text = content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text ?? "")
+      .join("\n");
+    return { text, isError: result.isError === true };
+  }
+
+  function firstLine(text: string): string {
+    return (text.split("\n")[0] ?? "").trim();
+  }
+
+  it("appends the bootstrap block to session_start text with the token first", async () => {
+    const session = await connectWithHarness();
+    try {
+      const started = await callTool(session, "session_start", { workspace: "alpha" });
+      expect(started.isError).toBe(false);
+      expect(firstLine(started.text)).toMatch(UUID_RE);
+      expect(started.text).toContain("works: (none)");
+      expect(started.text).toContain("latestSummary: (none)");
+      expect(started.text).toContain("next: explore");
+      expect(started.text).toContain("nuevo trabajo");
+      expect(started.text).toContain("continúa la sesión anterior");
+      expect(started.text).not.toMatch(/… \[truncated \d+ chars\]/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("appends the block to session_resume text with works, summary, and next", async () => {
+    const session = await connectWithHarness();
+    try {
+      const sessionToken = firstLine((await callTool(session, "session_start", {})).text);
+      const workToken = firstLine(
+        (await callTool(session, "work_start", { session: sessionToken, changeId: "change-1" })).text,
+      );
+      const staged = await callTool(session, "stage_write", {
+        session: sessionToken,
+        work: workToken,
+        stage: "spec",
+        body: "spec body for bootstrap",
+      });
+      expect(staged.isError).toBe(false);
+      const checked = await callTool(session, "checkpoint", {
+        session: sessionToken,
+        work: workToken,
+        completedStage: "spec",
+        artifactId: firstLine(staged.text),
+        summary: "spec checkpoint summary",
+      });
+      expect(checked.isError).toBe(false);
+      const resumed = await callTool(session, "session_resume", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(resumed.isError).toBe(false);
+      expect(resumed.text).toContain(`session: ${sessionToken}`);
+      expect(resumed.text).toContain(workToken);
+      expect(resumed.text).toContain("change-1");
+      expect(resumed.text).toContain("spec checkpoint summary");
+      expect(resumed.text).toContain("next: design");
+      expect(resumed.text).toContain("nuevo trabajo");
+      expect(resumed.text).not.toMatch(/… \[truncated \d+ chars\]/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("marks a truncated oversized summary in session_resume output", async () => {
+    const session = await connectWithHarness();
+    try {
+      const sessionToken = firstLine((await callTool(session, "session_start", {})).text);
+      const workToken = firstLine(
+        (await callTool(session, "work_start", { session: sessionToken })).text,
+      );
+      const staged = await callTool(session, "stage_write", {
+        session: sessionToken,
+        work: workToken,
+        stage: "spec",
+        body: "spec body for oversized bootstrap",
+      });
+      expect(staged.isError).toBe(false);
+      const checked = await callTool(session, "checkpoint", {
+        session: sessionToken,
+        work: workToken,
+        completedStage: "spec",
+        artifactId: firstLine(staged.text),
+        summary: "s".repeat(1200),
+      });
+      expect(checked.isError).toBe(false);
+      const resumed = await callTool(session, "session_resume", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(resumed.isError).toBe(false);
+      expect(resumed.text).toContain("… [truncated 700 chars]");
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("attaches a tokenless trigger-text turn to nothing", async () => {
+    const session = await connectWithHarness();
+    try {
+      const tokenless = await callTool(session, "session_resume", {});
+      expect(tokenless.isError).toBe(true);
+      expect(tokenless.text).toMatch(/session/i);
+    } finally {
+      await closeHarness(session);
+    }
   });
 });

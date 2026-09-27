@@ -714,7 +714,11 @@ describe("slice C continuation: opt-in JSON envelope on the single derivation", 
     }
   });
 
-  it("keeps session_resume default text byte-identical when format is omitted", async () => {
+  it("appends the Slice D bootstrap block to session_resume default text", async () => {
+    // Slice D (change harness-operability) supersedes the pre-D byte-identical
+    // pin for session_resume only: the handler appends the capped bootstrap
+    // block carrying the session works, latest summary, and derived next.
+    // harness_status default text stays byte-identical (pinned above).
     const session = await connectWithHarness();
     try {
       const { sessionToken, workToken } = await startSeededWork(session, "spec checkpoint summary");
@@ -733,6 +737,12 @@ describe("slice C continuation: opt-in JSON envelope on the single derivation", 
           "latestCheckpoint: seq 1 stage spec",
           "summary: spec checkpoint summary",
           "next: design",
+          `session: ${sessionToken}`,
+          `primaryWorkspace: ${rootA}`,
+          `works: ${workToken} (change-1)`,
+          "latestSummary: spec checkpoint summary",
+          "next: design",
+          `triggers: "nuevo trabajo" → work_start; "continúa la sesión anterior" → session_resume with token`,
         ].join("\n"),
       );
     } finally {

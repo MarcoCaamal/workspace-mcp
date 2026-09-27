@@ -194,6 +194,16 @@ export const MAX_RECALL_LIMIT = 50;
 export const SESSION_RETENTION_DAYS = 90;
 
 /**
+ * Slice D bootstrap (change harness-operability): hard caps for the dynamic
+ * bootstrap block returned by `session_start`/`session_resume`. Whole block
+ * at most 2000 chars with the embedded latest-checkpoint summary at most 500
+ * chars; any truncation carries an explicit `… [truncated N chars]` marker
+ * and never cuts silently. Config file untouched; constants first.
+ */
+export const BOOTSTRAP_MAX_CHARS = 2000;
+export const BOOTSTRAP_SUMMARY_MAX_CHARS = 500;
+
+/**
  * Slice A envelope (change harness-operability): versioned single-line
  * HTML-comment header carried inline in `stage_artifacts.body`.
  *
@@ -445,6 +455,11 @@ export interface HarnessStore {
     work: WorkRecord | null;
     latestCheckpoint: CheckpointRecord | null;
   };
+  /**
+   * Slice D bootstrap (change harness-operability): every work item bound to
+   * a session, oldest first, for the capped bootstrap block. Read-only.
+   */
+  listWorks(sessionId: string): WorkRecord[];
   writeStageArtifact(input: Omit<StageArtifactRecord, "id" | "createdAt">): StageArtifactRecord;
   readStageArtifact(
     artifactId: string,
@@ -941,6 +956,30 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           latestCheckpoint:
             checkpointRow === undefined ? null : toCheckpointRecord(checkpointRow),
         };
+      } catch (error) {
+        throw asStoreUnavailable(error);
+      }
+    },
+
+    listWorks(sessionId: string): WorkRecord[] {
+      try {
+        readSession(sessionId);
+        const rows = requireOpen()
+          .prepare("SELECT * FROM works WHERE session_id = ? ORDER BY rowid")
+          .all(sessionId) as Array<{
+          id: string;
+          session_id: string;
+          workspace: string;
+          change_id: string | null;
+          created_at: string;
+        }>;
+        return rows.map((row) => ({
+          id: row.id,
+          sessionId: row.session_id,
+          workspace: row.workspace,
+          changeId: row.change_id,
+          createdAt: row.created_at,
+        }));
       } catch (error) {
         throw asStoreUnavailable(error);
       }

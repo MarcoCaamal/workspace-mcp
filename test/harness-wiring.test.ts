@@ -546,3 +546,37 @@ describe("slice C continuation table: single source, no drift, zero metrics", ()
     );
   });
 });
+
+/**
+ * Slice D bootstrap hints (change harness-operability, task D.4 RED).
+ *
+ * `buildInstructions` surfaces the static bilingual natural-trigger hints
+ * and the per-stage contract surface (derived from the single-source table).
+ * Guidance only: no implicit resolution, no new registration flags.
+ */
+describe("slice D bootstrap hints in instructions", () => {
+  it("publishes the bilingual trigger hints as documented guidance", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const root = path.join(base, "bootstrap-hints");
+    await mkdir(root, { recursive: true });
+    const text = instructionsWithHarness([{ name: "default", path: root }]);
+    expect(text).toContain("nuevo trabajo");
+    expect(text).toContain("work_start");
+    expect(text).toContain("continúa la sesión anterior");
+    expect(text).toContain("session_resume");
+    expect(text).toMatch(/explicit.*token|token.*explicit/i);
+  });
+
+  it("surfaces every stage contract from the single-source table", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const root = path.join(base, "bootstrap-contracts");
+    await mkdir(root, { recursive: true });
+    const text = instructionsWithHarness([{ name: "default", path: root }]);
+    for (const stage of HARNESS_STAGES) {
+      expect(text, `instructions must surface stage ${stage}`).toContain(stage);
+      expect(text, `instructions must surface the ${stage} artifact`).toContain(
+        HARNESS_STAGE_CONTRACTS[stage].artifact,
+      );
+    }
+  });
+});
