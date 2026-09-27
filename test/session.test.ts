@@ -10,11 +10,13 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "../src/server.js";
 import {
+  ARCHIVED_AFTER_DAYS,
   BOOTSTRAP_MAX_CHARS,
   BOOTSTRAP_SUMMARY_MAX_CHARS,
   ENVELOPE_VERSION,
   HARNESS_STAGES,
   HarnessStoreError,
+  deriveSessionState,
   emitEnvelope,
   openHarnessStore,
   parseEnvelope,
@@ -104,10 +106,13 @@ describe("harness session store foundation", () => {
     );
   });
 
-  it("closes sessions explicitly and never revives them", () => {
+  it("closes sessions explicitly: writes reject while reads serve snapshots", () => {
+    // Slice E lifecycle v2 supersedes the hard-close throw: `resume` returns
+    // read-only data for ended sessions (see the Slice E suite below) while
+    // writes and a second end still reject; only `reopenSession` revives.
     const session = active().startSession(rootA);
     active().endSession(session.id);
-    expect(() => active().resume(session.id)).toThrowError(HarnessStoreError);
+    expect(active().resume(session.id).session.id).toBe(session.id);
     expect(() => active().startWork(session.id, rootA)).toThrowError(HarnessStoreError);
     expect(() => active().endSession(session.id)).toThrowError(HarnessStoreError);
   });
@@ -467,10 +472,12 @@ describe("harness store isolation and scope validation", () => {
   });
 
   it("reports closed sessions without reviving them", () => {
+    // Slice E lifecycle v2: `resume` serves the ended snapshot instead of
+    // throwing; the session stays ended (every write below still rejects).
     const session = active().startSession(rootA);
     const work = active().startWork(session.id, rootA, "change-1");
     active().endSession(session.id);
-    expect(() => active().resume(session.id, work.id)).toThrowError(HarnessStoreError);
+    expect(active().resume(session.id, work.id).session.id).toBe(session.id);
     expect(() => active().startWork(session.id, rootA)).toThrowError(HarnessStoreError);
     expect(() =>
       active().writeStageArtifact({
@@ -1436,6 +1443,434 @@ describe("slice D bootstrap block on start/resume", () => {
       const tokenless = await callTool(session, "session_resume", {});
       expect(tokenless.isError).toBe(true);
       expect(tokenless.text).toMatch(/session/i);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+});
+
+/**
+ * Slice E lifecycle v2 (change harness-operability, task E.1 RED).
+ *
+ * Store-level contract: a second `session_end` still rejects; every write
+ * (work, stage artifact, task list, checkpoint) against an ended session
+ * rejects with the existing `closed-session` code plus a `session_reopen`
+ * hint; `resume` on an ended session returns read-only data (never throws,
+ * never marks live); `deriveSessionState` labels freshly ended sessions
+ * `idle` and sessions ended longer than `ARCHIVED_AFTER_DAYS` ago
+ * `archived`; `reopenSession` revives explicitly with a notice while keeping
+ * `ended_at` and setting `reopened_at`; `purgeExpiredSessions` stays on the
+ * `ended_at` 90-day rule with live sessions (including reopened ones) never
+ * purged.
+ *
+ * NOTE: this supersedes the hard-close contract pinned by "closes sessions
+ * explicitly and never revives them" and "reports closed sessions without
+ * reviving them" above — `resume` no longer throws on ended sessions. Those
+ * two tests are migrated at GREEN step E.2.
+ */
+describe("slice E lifecycle v2: ended writes reject, reads snapshot, reopen is explicit (store)", () => {
+  let sandbox: string;
+  let rootA: string;
+  let rootB: string;
+  let dbPath: string;
+  let store: HarnessStore | null = null;
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(path.join(tmpdir(), "workspace-mcp-lifecycle-"));
+    rootA = path.join(sandbox, "root-a");
+    rootB = path.join(sandbox, "root-b");
+    await mkdir(rootA, { recursive: true });
+    await mkdir(rootB, { recursive: true });
+    dbPath = path.join(sandbox, "harness.db");
+    store = openHarnessStore({ dbPath, workspaceRoots: [rootA, rootB] });
+    store.open();
+  });
+
+  afterEach(async () => {
+    store?.close();
+    store = null;
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  function active(): HarnessStore {
+    if (store === null) {
+      throw new Error("store not open");
+    }
+    return store;
+  }
+
+  function seedEndedSession(): { sessionId: string; workId: string } {
+    const session = active().startSession(rootA);
+    const work = active().startWork(session.id, rootA, "change-1");
+    const artifact = active().writeStageArtifact({
+      sessionId: session.id,
+      workId: work.id,
+      workspace: rootA,
+      changeId: "change-1",
+      stage: "spec",
+      body: "spec body for lifecycle",
+    });
+    active().checkpoint({
+      sessionId: session.id,
+      workId: work.id,
+      workspace: rootA,
+      changeId: "change-1",
+      completedStage: "spec",
+      artifactId: artifact.id,
+      summary: "spec checkpoint summary",
+    });
+    active().endSession(session.id);
+    return { sessionId: session.id, workId: work.id };
+  }
+
+  function closedSessionCode(action: () => unknown): string {
+    try {
+      action();
+    } catch (error) {
+      return (error as HarnessStoreError).code;
+    }
+    throw new Error("expected a closed-session rejection");
+  }
+
+  it("still rejects a second session_end on an ended session", () => {
+    const session = active().startSession(rootA);
+    active().endSession(session.id);
+    expect(closedSessionCode(() => active().endSession(session.id))).toBe("closed-session");
+  });
+
+  it("rejects writes against an ended session with the closed-session code plus a session_reopen hint", () => {
+    const { sessionId, workId } = seedEndedSession();
+    const attempts: Array<() => unknown> = [
+      () => active().startWork(sessionId, rootA, "change-2"),
+      () =>
+        active().writeStageArtifact({
+          sessionId,
+          workId,
+          workspace: rootA,
+          changeId: "change-1",
+          stage: "design",
+          body: "design body after end",
+        }),
+      () =>
+        active().writeTaskList({
+          sessionId,
+          workId,
+          workspace: rootA,
+          changeId: "change-1",
+          body: "- [ ] task after end",
+          supersedes: null,
+        }),
+      () =>
+        active().checkpoint({
+          sessionId,
+          workId,
+          workspace: rootA,
+          changeId: "change-1",
+          completedStage: "spec",
+          artifactId: "00000000-0000-4000-8000-000000000000",
+          summary: "checkpoint after end",
+        }),
+    ];
+    expect(attempts.length).toBe(4);
+    for (const attempt of attempts) {
+      let error: unknown;
+      try {
+        attempt();
+      } catch (cause) {
+        error = cause;
+      }
+      expect(error).toBeInstanceOf(HarnessStoreError);
+      expect((error as HarnessStoreError).code).toBe("closed-session");
+      expect((error as HarnessStoreError).message).toMatch(/session_reopen/);
+    }
+  });
+
+  it("returns ended resume data without marking the session live", () => {
+    const { sessionId, workId } = seedEndedSession();
+    const resumed = active().resume(sessionId, workId);
+    expect(resumed.session.id).toBe(sessionId);
+    expect(resumed.latestCheckpoint?.summary).toBe("spec checkpoint summary");
+    expect(deriveSessionState(resumed.session)).toBe("idle");
+    expect(closedSessionCode(() => active().startWork(sessionId, rootA))).toBe(
+      "closed-session",
+    );
+  });
+
+  it("labels ended sessions idle, then archived past ARCHIVED_AFTER_DAYS", () => {
+    expect(ARCHIVED_AFTER_DAYS).toBe(30);
+    const session = active().startSession(rootA);
+    active().endSession(session.id);
+    expect(deriveSessionState(active().resume(session.id).session)).toBe("idle");
+    // Age the first-ended audit timestamp past the threshold with a raw
+    // update (the store never rewrites ended_at itself), then read the label
+    // through a fresh store instance.
+    active().close();
+    const raw = new DatabaseSync(dbPath);
+    try {
+      raw
+        .prepare("UPDATE sessions SET ended_at = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86400000).toISOString(), session.id);
+    } finally {
+      raw.close();
+    }
+    const aged = openHarnessStore({ dbPath, workspaceRoots: [rootA] });
+    aged.open();
+    try {
+      expect(deriveSessionState(aged.resume(session.id).session)).toBe("archived");
+    } finally {
+      aged.close();
+    }
+    store = openHarnessStore({ dbPath, workspaceRoots: [rootA, rootB] });
+    store.open();
+  });
+
+  it("reopens explicitly with a notice while keeping ended_at and setting reopened_at", () => {
+    const { sessionId } = seedEndedSession();
+    const before = active().resume(sessionId).session;
+    expect(before.endedAt).not.toBeNull();
+    const reopened = active().reopenSession(sessionId);
+    expect(reopened.notice).toMatch(/ended.*reopened/i);
+    expect(reopened.session.endedAt).toBe(before.endedAt);
+    expect(reopened.session.reopenedAt).not.toBeNull();
+    expect(deriveSessionState(reopened.session)).toBe("live");
+    const work = active().startWork(sessionId, rootA, "change-2");
+    expect(work.sessionId).toBe(sessionId);
+  });
+
+  it("keeps purge on the ended_at 90-day rule with live sessions never purged", () => {
+    const live = active().startSession(rootA);
+    const { sessionId: endedId } = seedEndedSession();
+    const reopened = active().startSession(rootA);
+    active().endSession(reopened.id);
+    active().reopenSession(reopened.id);
+    const purged = active().purgeExpiredSessions(
+      new Date(Date.now() + 120 * 86400000).toISOString(),
+    );
+    expect(purged).toContain(endedId);
+    expect(purged).not.toContain(live.id);
+    expect(purged).not.toContain(reopened.id);
+    expect(deriveSessionState(active().resume(reopened.id).session)).toBe("live");
+  });
+});
+
+/**
+ * Slice E lifecycle v2 over the transport (change harness-operability, task
+ * E.1 RED): `session_resume`/`harness_status` on ended sessions return
+ * read-only snapshots (state, latest checkpoint, derived next, reopen
+ * guidance) instead of throwing; `session_resume` without `session_reopen`
+ * never marks the session live; `session_reopen` returns the explicit
+ * ended-then-reopened notice and restores writes.
+ */
+describe("slice E lifecycle v2 over the transport: snapshots and session_reopen", () => {
+  let sandbox: string;
+  let rootA: string;
+  let dbPath: string;
+
+  interface HarnessClient {
+    client: Client;
+    server: McpServer;
+  }
+
+  interface ToolResponse {
+    text: string;
+    isError: boolean;
+  }
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(path.join(tmpdir(), "workspace-mcp-lifecycle-transport-"));
+    rootA = path.join(sandbox, "root-a");
+    await mkdir(rootA, { recursive: true });
+    dbPath = path.join(sandbox, "harness.db");
+  });
+
+  afterEach(async () => {
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  async function connectWithHarness(): Promise<HarnessClient> {
+    const store = openHarnessStore({ dbPath, workspaceRoots: [rootA] });
+    store.open();
+    const server = (createServer as (...args: unknown[]) => McpServer)({
+      workspaces: [{ name: "alpha", path: rootA }],
+      defaultWorkspace: "alpha",
+      version: "test",
+      harness: { session: true, store },
+    } as unknown);
+    const client = new Client({ name: "workspace-mcp-lifecycle-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    (server as unknown as { __harnessStore?: HarnessStore }).__harnessStore = store;
+    return { client, server };
+  }
+
+  async function closeHarness(session: HarnessClient): Promise<void> {
+    await session.client.close().catch(() => undefined);
+    await session.server.close().catch(() => undefined);
+    (session.server as unknown as { __harnessStore?: HarnessStore }).__harnessStore?.close();
+  }
+
+  async function callTool(
+    session: HarnessClient,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<ToolResponse> {
+    const result = await session.client.callTool({ name, arguments: args });
+    const content = (result.content ?? []) as Array<{ type: string; text?: string }>;
+    const text = content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text ?? "")
+      .join("\n");
+    return { text, isError: result.isError === true };
+  }
+
+  function firstLine(text: string): string {
+    return (text.split("\n")[0] ?? "").trim();
+  }
+
+  async function startSeededSession(session: HarnessClient): Promise<{
+    sessionToken: string;
+    workToken: string;
+  }> {
+    const started = await callTool(session, "session_start", { workspace: "alpha" });
+    expect(started.isError).toBe(false);
+    const sessionToken = firstLine(started.text);
+    const workStarted = await callTool(session, "work_start", {
+      session: sessionToken,
+      workspace: "alpha",
+      changeId: "change-1",
+    });
+    expect(workStarted.isError).toBe(false);
+    const workToken = firstLine(workStarted.text);
+    const staged = await callTool(session, "stage_write", {
+      session: sessionToken,
+      work: workToken,
+      workspace: "alpha",
+      stage: "spec",
+      body: "spec body for lifecycle snapshots",
+    });
+    expect(staged.isError).toBe(false);
+    const checked = await callTool(session, "checkpoint", {
+      session: sessionToken,
+      work: workToken,
+      workspace: "alpha",
+      completedStage: "spec",
+      artifactId: firstLine(staged.text),
+      summary: "spec checkpoint summary",
+    });
+    expect(checked.isError).toBe(false);
+    const ended = await callTool(session, "session_end", { session: sessionToken });
+    expect(ended.isError).toBe(false);
+    return { sessionToken, workToken };
+  }
+
+  it("still rejects a second session_end on an ended session", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken } = await startSeededSession(session);
+      const second = await callTool(session, "session_end", { session: sessionToken });
+      expect(second.isError).toBe(true);
+      expect(second.text).toMatch(/closed-session/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("rejects writes against an ended session with a session_reopen hint", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededSession(session);
+      const write = await callTool(session, "stage_write", {
+        session: sessionToken,
+        work: workToken,
+        workspace: "alpha",
+        stage: "design",
+        body: "design body after end",
+      });
+      expect(write.isError).toBe(true);
+      expect(write.text).toMatch(/closed-session/);
+      expect(write.text).toMatch(/session_reopen/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("serves session_resume as a read-only snapshot with reopen guidance", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededSession(session);
+      const resumed = await callTool(session, "session_resume", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(resumed.isError).toBe(false);
+      expect(resumed.text).toContain("state: idle");
+      expect(resumed.text).toContain("spec checkpoint summary");
+      expect(resumed.text).toContain("next: design");
+      expect(resumed.text).toMatch(/session_reopen/);
+      expect(resumed.text).not.toContain("nuevo trabajo");
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("serves harness_status as a read-only snapshot with reopen guidance", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededSession(session);
+      const status = await callTool(session, "harness_status", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(status.isError).toBe(false);
+      expect(status.text).toContain("state: idle");
+      expect(status.text).toContain("spec checkpoint summary");
+      expect(status.text).toContain("next: design");
+      expect(status.text).toMatch(/session_reopen/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("never marks an ended session live through resume", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededSession(session);
+      const resumed = await callTool(session, "session_resume", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(resumed.isError).toBe(false);
+      const write = await callTool(session, "stage_write", {
+        session: sessionToken,
+        work: workToken,
+        workspace: "alpha",
+        stage: "design",
+        body: "design body without reopen",
+      });
+      expect(write.isError).toBe(true);
+      expect(write.text).toMatch(/closed-session/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("reopens through session_reopen with an explicit notice and restores writes", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededSession(session);
+      const reopened = await callTool(session, "session_reopen", {
+        session: sessionToken,
+      });
+      expect(reopened.isError).toBe(false);
+      expect(reopened.text).toMatch(/ended.*reopened/i);
+      const write = await callTool(session, "stage_write", {
+        session: sessionToken,
+        work: workToken,
+        workspace: "alpha",
+        stage: "design",
+        body: "design body after reopen",
+      });
+      expect(write.isError).toBe(false);
     } finally {
       await closeHarness(session);
     }

@@ -111,7 +111,7 @@ describe("slice 2 wiring: harness tool registration", () => {
     }
   });
 
-  it("registers the eight harness tools when the harness flag is on", async () => {
+  it("registers the nine harness tools when the harness flag is on", async () => {
     const root = path.join(base, "flag-on");
     const { mkdir } = await import("node:fs/promises");
     await mkdir(root, { recursive: true });
@@ -126,6 +126,7 @@ describe("slice 2 wiring: harness tool registration", () => {
       for (const expected of [
         "session_start",
         "session_end",
+        "session_reopen",
         "work_start",
         "session_resume",
         "stage_write",
@@ -135,7 +136,7 @@ describe("slice 2 wiring: harness tool registration", () => {
       ]) {
         expect(names, `expected harness tool ${expected}`).toContain(expected);
       }
-      expect(names).toHaveLength(27);
+      expect(names).toHaveLength(28);
     } finally {
       await close(session);
     }
@@ -544,6 +545,56 @@ describe("slice C continuation table: single source, no drift, zero metrics", ()
     expect(JSON.stringify(HARNESS_STAGE_CONTRACTS)).not.toMatch(
       /coverag|cadence|hygiene|rework|gameable|advisor|metric|SELECT|%|harness_metrics|--harness-metrics/i,
     );
+  });
+});
+
+/**
+ * Slice E lifecycle v2 wiring (change harness-operability, task E.4 RED):
+ * `session_reopen` is registered only under the existing `harness.session`
+ * gate (no new flags), and the instructions carry the ended-state + reopen
+ * boundary sentence.
+ */
+describe("slice E lifecycle v2 wiring: session_reopen registration gate", () => {
+  it("registers session_reopen only under the harness session gate", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const root = path.join(base, "reopen-gate");
+    await mkdir(root, { recursive: true });
+    const store = openHarnessStore({
+      dbPath: path.join(base, "reopen-gate.db"),
+      workspaceRoots: [root],
+    });
+    store.open();
+    const session = await connect({
+      workspaces: [{ name: "default", path: root }],
+      harness: { session: true, store },
+    });
+    try {
+      const names = (await session.client.listTools()).tools.map((tool) => tool.name);
+      expect(names).toContain("session_reopen");
+    } finally {
+      await close(session);
+    }
+
+    const offRoot = path.join(base, "reopen-gate-off");
+    await mkdir(offRoot, { recursive: true });
+    const off = await connect({ workspaces: [{ name: "default", path: offRoot }] });
+    try {
+      const names = (await off.client.listTools()).tools.map((tool) => tool.name);
+      expect(names).toHaveLength(19);
+      expect(names).not.toContain("session_reopen");
+    } finally {
+      await close(off);
+    }
+  });
+
+  it("documents the ended-state plus reopen boundary in instructions", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const root = path.join(base, "reopen-instructions");
+    await mkdir(root, { recursive: true });
+    const text = instructionsWithHarness([{ name: "default", path: root }]);
+    expect(text).toContain("session_reopen");
+    expect(text).toMatch(/ended/i);
+    expect(text).toMatch(/snapshot|read-only/i);
   });
 });
 

@@ -50,7 +50,7 @@ export interface CreateServerOptions {
   shell?: ShellConfig;
   /**
    * Harness session surface (change chatgpt-workspace-harness).
-   * `session: true` plus a shared outside-repo `store` registers the eight
+   * `session: true` plus a shared outside-repo `store` registers the nine
    * session/work/stage tools; omitted or `session: false` restores the
    * pre-harness 19-tool surface. `recall: true` plus the same store registers
    * the scoped `harness_recall` tool (Slice 3); the legacy `recall` path stays
@@ -152,6 +152,7 @@ export function buildInstructions(
       `- Harness stage contracts (single source HARNESS_STAGE_CONTRACTS): ${stageContracts}.`,
       `- Natural triggers (documented guidance only, explicit tokens still required): "nuevo trabajo" → work_start; "continúa la sesión anterior" → session_resume with the issued token. Trigger text with no token attaches to nothing; sessions are never resolved implicitly.`,
       `- ${METRICS_BOUNDARY_SENTENCE}`,
+      "- Ended sessions stay terminal for writes and serve read-only snapshots on status and resume; reopen one explicitly with session_reopen.",
       "- Jobs do not survive a server restart: after a restart every pre-restart job id reports unknown job id, while session/work/stage state resumes from the store by explicit token.",
       "",
     );
