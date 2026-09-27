@@ -249,6 +249,36 @@ describe("scoped harness recall (store level)", () => {
     const rows = active().searchStageArtifacts("zebra", { sessionId: sessionA, limit: 500 });
     expect(rows.length).toBeLessThanOrEqual(50);
   });
+
+  it("keeps header-carrying bodies recallable via bm25 and returns the free body", () => {
+    const session = active().startSession(rootA);
+    const work = active().startWork(session.id, rootA, "change-1");
+    const body = "envelope recall body about apricot turbine latticework";
+    const artifact = active().writeStageArtifact({
+      sessionId: session.id,
+      workId: work.id,
+      workspace: rootA,
+      changeId: "change-1",
+      stage: "design",
+      body,
+    });
+    const rows = active().searchStageArtifacts("apricot turbine", {
+      sessionId: session.id,
+      limit: 20,
+    });
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.id).toBe(artifact.id);
+    expect(rows[0]?.body).toBe(body);
+  });
+
+  it("does not let header tokens break scoped recall isolation", () => {
+    const { sessionA, sessionB } = seedTwoSessions();
+    const rowsA = active().searchStageArtifacts("zebra", { sessionId: sessionA, limit: 20 });
+    expect(rowsA.length).toBeGreaterThan(0);
+    expect(rowsA.every((row) => row.sessionId === sessionA)).toBe(true);
+    const rowsB = active().searchStageArtifacts("zebra", { sessionId: sessionB, limit: 20 });
+    expect(rowsB.length).toBe(0);
+  });
 });
 
 describe("scoped harness recall (handler level)", () => {
