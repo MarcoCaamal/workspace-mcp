@@ -270,6 +270,43 @@ export interface HarnessStatusResult {
   unverified: boolean;
 }
 
+/**
+ * Slice B metrics (change harness-operability): read-only operator-local
+ * snapshot over already-stored rows. Six deterministic signals computed with
+ * SELECT-only queries (zero writes); advisory only, never gates.
+ */
+export interface MetricsSnapshot {
+  /** Share of stage artifacts carrying at least one checkpoint. */
+  coverage: { withCheckpoint: number; total: number };
+  /**
+   * Checkpoint stage sequence per work compared against the canonical
+   * ordered stage list. Forward jumps are permitted (operator may proceed
+   * out of order with visibility); backward or repeated transitions count
+   * as bypasses.
+   */
+  order: { compliant: number; total: number; bypasses: number };
+  /** Counts of live versus ended sessions plus the oldest live session age. */
+  hygiene: { live: number; ended: number; oldestLiveAgeMs: number | null };
+  /** Time deltas between consecutive checkpoints per work item. */
+  cadenceMs: Array<{ workId: string; deltasMs: number[] }>;
+  /** Repeated checkpoints for the same stage on the same work item. */
+  rework: Array<{ workId: string; stage: string; count: number }>;
+  /** Task-row counts per work item. */
+  taskUsage: Array<{ workId: string; taskRows: number }>;
+  /** Always present: advisory + gameable, never gates. */
+  advisoryCaveat: string;
+}
+
+/**
+ * Advisory caveat carried by every metrics snapshot and every rendering of
+ * it. Names the gaming risk explicitly so perfect scores are never read as
+ * proof of diligence.
+ */
+export const METRICS_ADVISORY_CAVEAT =
+  "Advisory only: harness health signals are gameable — perfect order and " +
+  "coverage can coexist with rubber-stamped stages. Never use these figures " +
+  "as execution gates.";
+
 export interface RecallScope {
   /** Explicit session token; REQUIRED on every harness FTS query. */
   sessionId: string;
@@ -304,6 +341,12 @@ export interface HarnessStore {
   readTaskList(taskId: string, opts: { sessionId: string; workId?: string }): HarnessTaskRecord;
   checkpoint(input: Omit<CheckpointRecord, "seq" | "createdAt">): CheckpointRecord;
   harnessStatus(sessionId: string, workId?: string): HarnessStatusResult;
+  /**
+   * Slice B metrics (change harness-operability): SELECT-only aggregation
+   * over existing rows returning the six-signal {@link MetricsSnapshot}.
+   * Performs zero writes; an unreachable store throws `store-unavailable`.
+   */
+  getMetricsSnapshot(): MetricsSnapshot;
   /** Scoped recall: session required; work/workspace narrow; never global. */
   searchCheckpoints(query: string, opts: RecallScope): CheckpointRecord[];
   searchStageArtifacts(query: string, opts: RecallScope): StageArtifactRecord[];
@@ -863,6 +906,151 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           reason: reasons.join("; "),
           latestCheckpoint,
           unverified,
+        };
+      } catch (error) {
+        throw asStoreUnavailable(error);
+      }
+    },
+
+    getMetricsSnapshot(): MetricsSnapshot {
+      try {
+        const db = requireOpen();
+        // Coverage: share of stage artifacts carrying at least one checkpoint.
+        const coverageTotal = (
+          db.prepare("SELECT COUNT(*) AS n FROM stage_artifacts").get() as { n: number }
+        ).n;
+        const withCheckpoint = (
+          db
+            .prepare(
+              "SELECT COUNT(*) AS n FROM stage_artifacts WHERE id IN (SELECT DISTINCT artifact_id FROM checkpoints)",
+            )
+            .get() as { n: number }
+        ).n;
+
+        // Order: per-work checkpoint sequence against the canonical ordered
+        // stage list. Forward jumps are permitted; backward or repeated
+        // transitions count as bypasses. Unknown stages cannot be ordered.
+        const orderedCheckpoints = db
+          .prepare(
+            "SELECT work_id, completed_stage FROM checkpoints ORDER BY work_id ASC, seq ASC",
+          )
+          .all() as Array<{ work_id: string; completed_stage: string }>;
+        let orderTotal = 0;
+        let orderCompliant = 0;
+        let orderBypasses = 0;
+        let previousWork: string | null = null;
+        let previousIndex = -1;
+        for (const row of orderedCheckpoints) {
+          if (row.work_id !== previousWork) {
+            previousWork = row.work_id;
+            previousIndex = -1;
+          }
+          orderTotal += 1;
+          const index = (HARNESS_STAGES as readonly string[]).indexOf(row.completed_stage);
+          if (index === -1 || index <= previousIndex) {
+            orderBypasses += 1;
+          } else {
+            orderCompliant += 1;
+            previousIndex = index;
+          }
+        }
+
+        // Hygiene: live versus ended counts plus the oldest live session age.
+        // The age reference is the latest stored event timestamp (max
+        // created_at across all tables), never the wall clock, so consecutive
+        // snapshots of an unchanged store stay byte-identical (determinism
+        // scenario, including CLI double-runs seconds apart).
+        const hygieneRows = db
+          .prepare("SELECT ended_at, created_at FROM sessions")
+          .all() as Array<{ ended_at: string | null; created_at: string }>;
+        let live = 0;
+        let ended = 0;
+        let oldestLiveCreated: number | null = null;
+        for (const row of hygieneRows) {
+          if (row.ended_at !== null) {
+            ended += 1;
+          } else {
+            live += 1;
+            const created = new Date(row.created_at).getTime();
+            if (oldestLiveCreated === null || created < oldestLiveCreated) {
+              oldestLiveCreated = created;
+            }
+          }
+        }
+        const latestEvent = (
+          db
+            .prepare(
+              "SELECT MAX(created_at) AS latest FROM (" +
+                "SELECT created_at FROM sessions UNION ALL " +
+                "SELECT created_at FROM works UNION ALL " +
+                "SELECT created_at FROM stage_artifacts UNION ALL " +
+                "SELECT created_at FROM harness_tasks UNION ALL " +
+                "SELECT created_at FROM checkpoints)",
+            )
+            .get() as { latest: string | null }
+        ).latest;
+        const oldestLiveAgeMs =
+          oldestLiveCreated === null || latestEvent === null
+            ? null
+            : Math.max(0, new Date(latestEvent).getTime() - oldestLiveCreated);
+
+        // Cadence: deltas between consecutive checkpoints per work item.
+        const cadenceRows = db
+          .prepare("SELECT work_id, created_at FROM checkpoints ORDER BY work_id ASC, seq ASC")
+          .all() as Array<{ work_id: string; created_at: string }>;
+        const cadenceMs: MetricsSnapshot["cadenceMs"] = [];
+        let cadenceWork: string | null = null;
+        let cadencePrevious: number | null = null;
+        let cadenceDeltas: number[] = [];
+        const flushCadence = (): void => {
+          if (cadenceWork !== null && cadenceDeltas.length > 0) {
+            cadenceMs.push({ workId: cadenceWork, deltasMs: cadenceDeltas });
+          }
+          cadenceDeltas = [];
+        };
+        for (const row of cadenceRows) {
+          if (row.work_id !== cadenceWork) {
+            flushCadence();
+            cadenceWork = row.work_id;
+            cadencePrevious = null;
+          }
+          const at = new Date(row.created_at).getTime();
+          if (cadencePrevious !== null) {
+            cadenceDeltas.push(at - cadencePrevious);
+          }
+          cadencePrevious = at;
+        }
+        flushCadence();
+
+        // Rework: repeated checkpoints for the same stage on the same work.
+        const rework = (
+          db
+            .prepare(
+              "SELECT work_id, completed_stage AS stage, COUNT(*) AS count FROM checkpoints " +
+                "GROUP BY work_id, completed_stage HAVING COUNT(*) > 1 " +
+                "ORDER BY work_id ASC, completed_stage ASC",
+            )
+            .all() as Array<{ work_id: string; stage: string; count: number }>
+        ).map((row) => ({ workId: row.work_id, stage: row.stage, count: row.count }));
+
+        // Task usage: task-row counts per work item.
+        const taskUsage = (
+          db
+            .prepare(
+              "SELECT work_id, COUNT(*) AS task_rows FROM harness_tasks " +
+                "GROUP BY work_id ORDER BY work_id ASC",
+            )
+            .all() as Array<{ work_id: string; task_rows: number }>
+        ).map((row) => ({ workId: row.work_id, taskRows: row.task_rows }));
+
+        return {
+          coverage: { withCheckpoint, total: coverageTotal },
+          order: { compliant: orderCompliant, total: orderTotal, bypasses: orderBypasses },
+          hygiene: { live, ended, oldestLiveAgeMs },
+          cadenceMs,
+          rework,
+          taskUsage,
+          advisoryCaveat: METRICS_ADVISORY_CAVEAT,
         };
       } catch (error) {
         throw asStoreUnavailable(error);
