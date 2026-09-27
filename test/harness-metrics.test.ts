@@ -230,6 +230,17 @@ describe("harness metrics snapshot from the external store", () => {
     expect(live.id.length).toBeGreaterThan(0);
   });
 
+  it("counts a reopened session as live in hygiene", () => {
+    const reopened = active().startSession(rootA);
+    active().endSession(reopened.id);
+    active().reopenSession(reopened.id);
+    const snapshot: MetricsSnapshot = active().getMetricsSnapshot();
+    expect(snapshot.hygiene.live).toBe(1);
+    expect(snapshot.hygiene.ended).toBe(0);
+    expect(snapshot.hygiene.oldestLiveAgeMs).not.toBeNull();
+    expect(snapshot.hygiene.oldestLiveAgeMs!).toBeGreaterThanOrEqual(0);
+  });
+
   it("performs zero writes against a reachable store", () => {
     seedOrderedWork();
     const before = rowCounts();
