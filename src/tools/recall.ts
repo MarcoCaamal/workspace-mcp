@@ -1,6 +1,10 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { readNotes } from "../state.js";
+import {
+  BOOTSTRAP_MAX_CHARS,
+  BOOTSTRAP_SUMMARY_MAX_CHARS,
+} from "../session-store.js";
 import type { CheckpointRecord, StageArtifactRecord } from "../session-store.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
 import { describeError, errorResult, textResult, workspaceArg } from "./shared.js";
@@ -119,8 +123,110 @@ export function filterEnrichedLines(
   );
 }
 
-export function renderHarnessRecall(input: {
-  stages: readonly StageArtifactRecord[];
+/**
+ * Slice C continuation lines (change harness-operability): shared rendering
+ * of the derived continuation so the `harness_status` and `session_resume`
+ * text paths print identical lines from the single store derivation.
+ */
+export function renderContinuationLines(status: {
+  currentStage: string | null;
+  next: string;
+  reason: string;
+}): string[] {
+  return [
+    `currentStage: ${status.currentStage ?? "(none)"}`,
+    `next: ${status.next}`,
+    `reason: ${status.reason}`,
+  ];
+}
+
+/** Shared rendering of the latest-checkpoint text lines (Slice C). */
+export function renderCheckpointLines(checkpoint: {
+  seq: number;
+  completedStage: string;
+  summary: string;
+} | null): string[] {
+  if (checkpoint === null) {
+    return ["latestCheckpoint: (none)"];
+  }
+  return [
+    `latestCheckpoint: seq ${checkpoint.seq} stage ${checkpoint.completedStage}`,
+    `summary: ${checkpoint.summary}`,
+  ];
+}
+
+/** One work entry carried by the Slice D bootstrap block. */
+export interface BootstrapWork {
+  id: string;
+  changeId: string | null;
+}
+
+/** Input for the Slice D bootstrap block renderer. */
+export interface BootstrapBlockInput {
+  sessionId: string;
+  primaryWorkspace: string;
+  works: readonly BootstrapWork[];
+  latestSummary: string | null;
+  next: string;
+}
+
+/**
+ * Static bilingual natural-trigger hints (Slice D). Documented guidance
+ * only: session resolution stays explicit-token, so a turn carrying trigger
+ * text but no token still attaches to nothing.
+ */
+export const BOOTSTRAP_TRIGGER_HINTS =
+  `triggers: "nuevo trabajo" → work_start; ` +
+  `"continúa la sesión anterior" → session_resume with token`;
+
+/**
+ * Slice D bootstrap block (change harness-operability): pure capped renderer
+ * for the dynamic context block appended to `session_start`/`session_resume`
+ * text output. Postcondition: `result.length <= BOOTSTRAP_MAX_CHARS` with the
+ * embedded summary capped at `BOOTSTRAP_SUMMARY_MAX_CHARS`. Any truncation
+ * appends an explicit `… [truncated N chars]` marker and never cuts silently;
+ * small sessions render complete with no marker. Carries no metric values.
+ */
+export function renderBootstrapBlock(input: BootstrapBlockInput): string {
+  const summary = input.latestSummary ?? "(none)";
+  const worksLine =
+    input.works.length === 0
+      ? "works: (none)"
+      : `works: ${input.works.map((work) => `${work.id} (${work.changeId ?? "unbound"})`).join(", ")}`;
+  const block = [
+    `session: ${input.sessionId}`,
+    `primaryWorkspace: ${input.primaryWorkspace}`,
+    worksLine,
+    `latestSummary: ${capBootstrapSummary(summary)}`,
+    `next: ${input.next}`,
+    BOOTSTRAP_TRIGGER_HINTS,
+  ].join("\n");
+  if (block.length <= BOOTSTRAP_MAX_CHARS) {
+    return block;
+  }
+  const removed = block.length - BOOTSTRAP_MAX_CHARS;
+  const marker = `… [truncated ${removed} chars]`;
+  return `${block.slice(0, BOOTSTRAP_MAX_CHARS - marker.length)}${marker}`;
+}
+
+/** Caps the embedded bootstrap summary with an explicit truncation marker. */
+function capBootstrapSummary(summary: string): string {
+  if (summary.length <= BOOTSTRAP_SUMMARY_MAX_CHARS) {
+    return summary;
+  }
+  const removed = summary.length - BOOTSTRAP_SUMMARY_MAX_CHARS;
+  return `${summary.slice(0, BOOTSTRAP_SUMMARY_MAX_CHARS)}… [truncated ${removed} chars]`;
+}
+
+/**
+ * Slice E lifecycle v2 (change harness-operability): reopen guidance carried
+ * by every ended snapshot and ended-write rejection. Names the explicit
+ * path only; carries no metric values.
+ */
+export const ENDED_SESSION_REOPEN_GUIDANCE =
+  "session is ended; call session_reopen with the session token to reopen it";
+
+export function renderHarnessRecall(input: {  stages: readonly StageArtifactRecord[];
   checkpoints: readonly CheckpointRecord[];
   enriched: readonly RecallEnrichedLine[];
   degraded: readonly RecallEnrichmentSource[];

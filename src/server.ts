@@ -1,6 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { DEFAULT_SHELL_ALLOW, type ShellConfig } from "./shell.js";
-import type { HarnessStore } from "./session-store.js";
+import {
+  HARNESS_STAGE_CONTRACTS,
+  HARNESS_STAGES,
+  type HarnessStage,
+  type HarnessStore,
+} from "./session-store.js";
 import { registerChangeTools } from "./tools/changes.js";
 import { registerEditTool } from "./tools/edit.js";
 import { registerGitTools } from "./tools/git.js";
@@ -21,6 +26,19 @@ import { WorkspaceRegistry, type WorkspaceConfig } from "./workspaces.js";
 export const SERVER_NAME = "workspace-mcp";
 export const FALLBACK_VERSION = "0.0.0";
 
+/**
+ * Slice B metrics boundary (change harness-operability, design open
+ * question): the single static sentence that lets the model redirect a chat
+ * metrics request to the operator without ever carrying a value. It names
+ * categories only — no tool, no values, no query syntax — and is asserted by
+ * `test/harness-wiring.test.ts` to be the only `metric*` text in the
+ * instructions. Wording adopted verbatim from design at Slice B apply; flag
+ * in review if it must change.
+ */
+export const METRICS_BOUNDARY_SENTENCE =
+  "Harness health signals are operator-local: never report coverage, cadence, " +
+  "hygiene, or rework figures in chat; redirect such requests to Marco.";
+
 export interface CreateServerOptions {
   /** Named workspace roots. Each tool resolves one of them per call. */
   workspaces: WorkspaceConfig[];
@@ -32,7 +50,7 @@ export interface CreateServerOptions {
   shell?: ShellConfig;
   /**
    * Harness session surface (change chatgpt-workspace-harness).
-   * `session: true` plus a shared outside-repo `store` registers the eight
+   * `session: true` plus a shared outside-repo `store` registers the nine
    * session/work/stage tools; omitted or `session: false` restores the
    * pre-harness 19-tool surface. `recall: true` plus the same store registers
    * the scoped `harness_recall` tool (Slice 3); the legacy `recall` path stays
@@ -116,12 +134,25 @@ export function buildInstructions(
   );
 
   if (harness?.session === true) {
+    // Slice D bootstrap (change harness-operability): per-stage contract
+    // surface rendered from the single-source table next to HARNESS_STAGES,
+    // so instruction text cannot drift from the real tool surface.
+    const stageContracts = (HARNESS_STAGES as readonly HarnessStage[])
+      .map(
+        (stage) =>
+          `${stage} → ${HARNESS_STAGE_CONTRACTS[stage].artifact} via ${HARNESS_STAGE_CONTRACTS[stage].allowedActions.join(", ")}`,
+      )
+      .join("; ");
     lines.push(
       "Harness sessions (stateful SDD flow):",
       "- Start with session_start to receive an opaque session token bound to one workspace; present it (plus the work token from work_start) explicitly on every harness call. Tunnel, connection, and profile identifiers are never session identity: a tokenless session-scoped call is rejected and attaches to nothing.",
       "- Bearer and token-possession semantics: the shared HTTP bearer gates transport access only. Within an authenticated tunnel, possession of a session/work token controls that session; there is no per-caller identity and no stronger conversation-isolation claim.",
       "- New harness state (sessions, works, stage artifacts, task bodies, checkpoints, summaries) lives only in the outside-repo store; stage progression creates no repo-local files. The legacy tools above still write repo-local state under <root>/.workspace-mcp/ and serve the legacy flow only.",
       "- Harness stages in order: explore, propose, spec, design, tasks, apply, verify. harness_status derives the next action from the external store; a stage artifact without a checkpoint is flagged unverified (honest, never a gate). Out-of-order checkpoints are permitted and recorded.",
+      `- Harness stage contracts (single source HARNESS_STAGE_CONTRACTS): ${stageContracts}.`,
+      `- Natural triggers (documented guidance only, explicit tokens still required): "nuevo trabajo" → work_start; "continúa la sesión anterior" → session_resume with the issued token. Trigger text with no token attaches to nothing; sessions are never resolved implicitly.`,
+      `- ${METRICS_BOUNDARY_SENTENCE}`,
+      "- Ended sessions stay terminal for writes and serve read-only snapshots on status and resume; reopen one explicitly with session_reopen.",
       "- Jobs do not survive a server restart: after a restart every pre-restart job id reports unknown job id, while session/work/stage state resumes from the store by explicit token.",
       "",
     );

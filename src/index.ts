@@ -19,6 +19,7 @@ import {
 } from "./config.js";
 import { shutdownJobs } from "./jobs.js";
 import { createServer, FALLBACK_VERSION, SERVER_NAME } from "./server.js";
+import { formatMetricsHuman, formatMetricsJson } from "./harness-metrics.js";
 import { openHarnessStore, type HarnessStore } from "./session-store.js";
 import type { ShellConfig } from "./shell.js";
 import type { WorkspaceConfig } from "./workspaces.js";
@@ -33,6 +34,8 @@ interface CliOptions {
   port: number | undefined;
   token: string | undefined;
   shell: { flag: boolean; any: boolean; allow: string[] | undefined };
+  harnessMetrics: boolean;
+  format: string | undefined;
   config: string | undefined;
   help: boolean;
   version: boolean;
@@ -70,6 +73,8 @@ function printHelp(): void {
       "  --shell         Enable run_command and the background job tools in allowlist mode. Off by default.",
       "  --shell-any     Enable them in unrestricted mode (any executable). Implies --shell and prints a warning.",
       "  --shell-allow <list>  Add executables to the allowlist (comma-separated and/or repeated; only used when enabled).",
+      "  --harness-metrics   Print the operator-local harness health snapshot and exit. Never an MCP tool.",
+      "  --format <human|json>  Metrics output shape. Default: human. Only used with --harness-metrics.",
       "  -h, --help      Show this help.",
       "  -v, --version   Show the version.",
       "",
@@ -97,6 +102,8 @@ function parseCliOptions(argv: string[]): CliOptions {
       port: { type: "string" },
       token: { type: "string" },
       shell: { type: "boolean", default: false },
+      "harness-metrics": { type: "boolean", default: false },
+      format: { type: "string" },
       "shell-any": { type: "boolean", default: false },
       "shell-allow": { type: "string", multiple: true },
       help: { type: "boolean", short: "h", default: false },
@@ -111,6 +118,17 @@ function parseCliOptions(argv: string[]): CliOptions {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new Error(`invalid --port: ${values.port}`);
     }
+  }
+
+  // Slice B metrics (change harness-operability): operator-local CLI surface
+  // only. The format is validated here; the snapshot itself is printed from
+  // main() after config resolution and the process exits without serving.
+  const format = values.format;
+  if (values["harness-metrics"] !== true && format !== undefined) {
+    throw new Error("--format requires --harness-metrics");
+  }
+  if (format !== undefined && format !== "human" && format !== "json") {
+    throw new Error(`invalid --format: ${format} (expected human|json)`);
   }
 
   return {
@@ -128,6 +146,8 @@ function parseCliOptions(argv: string[]): CliOptions {
     },
     help: values.help === true,
     version: values.version === true,
+    harnessMetrics: values["harness-metrics"] === true,
+    format,
   };
 }
 
@@ -373,6 +393,37 @@ async function main(): Promise<void> {
     if ((shell.deny ?? []).length > 0) {
       log(`denied executables (enforced in every mode): ${shell.deny!.join(", ")}`);
     }
+  }
+
+  // Slice B metrics (change harness-operability): operator-local CLI path.
+  // Reuses the resolved config (workspace roots for scope validation, the
+  // configured outside-repo DB path) plus openHarnessStore, so DB-path
+  // validation and store-unavailable failure apply unchanged. Prints the
+  // SELECT-only snapshot and exits; registers NOTHING via server.registerTool
+  // (there is no metrics MCP tool under any flag combination).
+  if (options.harnessMetrics) {
+    const metricsStore = openHarnessStore({
+      dbPath: resolved.harness.dbPath,
+      workspaceRoots: workspaceConfigs.map((workspace) => workspace.path),
+    });
+    try {
+      metricsStore.open();
+    } catch (error) {
+      log(`harness store unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const snapshot = metricsStore.getMetricsSnapshot();
+      const output = options.format === "json" ? formatMetricsJson(snapshot) : formatMetricsHuman(snapshot);
+      process.stdout.write(`${output}\n`);
+    } catch (error) {
+      log(`harness store unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    } finally {
+      metricsStore.close();
+    }
+    return;
   }
 
   // Harness store (change chatgpt-workspace-harness, tasks 3.2/4.2): opened

@@ -3,17 +3,26 @@ import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "../src/server.js";
 import {
+  ARCHIVED_AFTER_DAYS,
+  BOOTSTRAP_MAX_CHARS,
+  BOOTSTRAP_SUMMARY_MAX_CHARS,
+  ENVELOPE_VERSION,
   HARNESS_STAGES,
   HarnessStoreError,
+  deriveSessionState,
+  emitEnvelope,
   openHarnessStore,
+  parseEnvelope,
   type HarnessStore,
 } from "../src/session-store.js";
+import { renderBootstrapBlock } from "../src/tools/recall.js";
 
 /**
  * Store foundation (change chatgpt-workspace-harness, task 2.3).
@@ -97,10 +106,13 @@ describe("harness session store foundation", () => {
     );
   });
 
-  it("closes sessions explicitly and never revives them", () => {
+  it("closes sessions explicitly: writes reject while reads serve snapshots", () => {
+    // Slice E lifecycle v2 supersedes the hard-close throw: `resume` returns
+    // read-only data for ended sessions (see the Slice E suite below) while
+    // writes and a second end still reject; only `reopenSession` revives.
     const session = active().startSession(rootA);
     active().endSession(session.id);
-    expect(() => active().resume(session.id)).toThrowError(HarnessStoreError);
+    expect(active().resume(session.id).session.id).toBe(session.id);
     expect(() => active().startWork(session.id, rootA)).toThrowError(HarnessStoreError);
     expect(() => active().endSession(session.id)).toThrowError(HarnessStoreError);
   });
@@ -157,6 +169,41 @@ describe("harness session store foundation", () => {
     const read = active().readStageArtifact(artifact.id, { sessionId: session.id });
     expect(read.body).toBe(body);
     expect(read.stage).toBe("propose");
+  });
+
+  it("persists the versioned envelope header inline while reading back the free body", () => {
+    const session = active().startSession(rootA);
+    const work = active().startWork(session.id, rootA, "change-1");
+    const body = "# Proposal\n\nEnvelope wiring check.";
+    const artifact = active().writeStageArtifact({
+      sessionId: session.id,
+      workId: work.id,
+      workspace: rootA,
+      changeId: "change-1",
+      stage: "propose",
+      body,
+    });
+    const db = new DatabaseSync(dbPath);
+    try {
+      const row = db
+        .prepare("SELECT body FROM stage_artifacts WHERE id = ?")
+        .get(artifact.id) as { body: string };
+      const parsed = parseEnvelope(row.body);
+      expect(parsed.header).toMatchObject({
+        stage: "propose",
+        sessionId: session.id,
+        workId: work.id,
+        artifactId: artifact.id,
+        createdAt: artifact.createdAt,
+        bodyLength: body.length,
+      });
+      expect(parsed.body).toBe(body);
+    } finally {
+      db.close();
+    }
+    expect(active().readStageArtifact(artifact.id, { sessionId: session.id }).body).toBe(
+      body,
+    );
   });
 
   it("rejects unknown stage names with the valid list", () => {
@@ -425,10 +472,12 @@ describe("harness store isolation and scope validation", () => {
   });
 
   it("reports closed sessions without reviving them", () => {
+    // Slice E lifecycle v2: `resume` serves the ended snapshot instead of
+    // throwing; the session stays ended (every write below still rejects).
     const session = active().startSession(rootA);
     const work = active().startWork(session.id, rootA, "change-1");
     active().endSession(session.id);
-    expect(() => active().resume(session.id, work.id)).toThrowError(HarnessStoreError);
+    expect(active().resume(session.id, work.id).session.id).toBe(session.id);
     expect(() => active().startWork(session.id, rootA)).toThrowError(HarnessStoreError);
     expect(() =>
       active().writeStageArtifact({
@@ -1004,6 +1053,826 @@ describe("harness transport identity", () => {
       expect(statusWithoutToken.isError).toBe(true);
     } finally {
       await closeTurn(turn);
+    }
+  });
+});
+
+/**
+ * Slice A envelope (change harness-operability, tasks A.1): versioned
+ * single-line HTML-comment header emitted at `stage_write` and parsed at
+ * `readStageArtifact`, with tolerant fallback to plain text.
+ *
+ * Delimiter choice (recorded at apply, design open question): the exact
+ * single-line form from design —
+ * `<!-- harness-envelope v1 stage="…" sessionId="…" workId="…" artifactId="…"
+ * createdAt="…" bodyLength="…" -->` — is the compatibility surface.
+ */
+describe("harness stage-artifact envelope (pure emit/parse)", () => {
+  it("round-trips all six header fields with bodyLength excluding the header", () => {
+    const body = "# Design\n\nFree-form markdown body.";
+    const stored = emitEnvelope(
+      {
+        stage: "design",
+        sessionId: "11111111-1111-4111-8111-111111111111",
+        workId: "22222222-2222-4222-8222-222222222222",
+        artifactId: "33333333-3333-4333-8333-333333333333",
+        createdAt: "2026-09-26T00:00:00.000Z",
+      },
+      body,
+    );
+    expect(ENVELOPE_VERSION).toBe(1);
+    const parsed = parseEnvelope(stored);
+    expect(parsed.header).not.toBeNull();
+    expect(parsed.header).toMatchObject({
+      stage: "design",
+      sessionId: "11111111-1111-4111-8111-111111111111",
+      workId: "22222222-2222-4222-8222-222222222222",
+      artifactId: "33333333-3333-4333-8333-333333333333",
+      createdAt: "2026-09-26T00:00:00.000Z",
+      bodyLength: body.length,
+    });
+    expect(parsed.body).toBe(body);
+    expect(parsed.header?.bodyLength).toBeLessThan(stored.length);
+  });
+
+  it("emits a single versioned HTML-comment first line", () => {
+    const stored = emitEnvelope(
+      {
+        stage: "spec",
+        sessionId: "s",
+        workId: "w",
+        artifactId: "a",
+        createdAt: "2026-09-26T00:00:00.000Z",
+      },
+      "body text",
+    );
+    const [firstLine, ...rest] = stored.split("\n");
+    expect(firstLine).toMatch(/^<!-- harness-envelope v1 .* -->$/);
+    expect(rest.join("\n")).toBe("body text");
+  });
+
+  it("round-trips multiline and empty bodies byte-identically", () => {
+    const multiline = "line one\n\nline two\n```\ncode\n```\n";
+    const parsedMulti = parseEnvelope(
+      emitEnvelope(
+        {
+          stage: "tasks",
+          sessionId: "s",
+          workId: "w",
+          artifactId: "a",
+          createdAt: "2026-09-26T00:00:00.000Z",
+        },
+        multiline,
+      ),
+    );
+    expect(parsedMulti.body).toBe(multiline);
+    expect(parsedMulti.header?.bodyLength).toBe(multiline.length);
+
+    const parsedEmpty = parseEnvelope(
+      emitEnvelope(
+        {
+          stage: "tasks",
+          sessionId: "s",
+          workId: "w",
+          artifactId: "a",
+          createdAt: "2026-09-26T00:00:00.000Z",
+        },
+        "",
+      ),
+    );
+    expect(parsedEmpty.body).toBe("");
+    expect(parsedEmpty.header?.bodyLength).toBe(0);
+  });
+
+  it("treats pre-change bodies with no header as full free text", () => {
+    const legacy = "# Proposal\n\nBody bytes live in the store.";
+    const parsed = parseEnvelope(legacy);
+    expect(parsed.header).toBeNull();
+    expect(parsed.body).toBe(legacy);
+  });
+
+  it("trusts no header field when the first line is malformed", () => {
+    const malformed =
+      `<!-- harness-envelope v1 stage="design" sessionId="s" -->\nReal body.`;
+    const parsed = parseEnvelope(malformed);
+    expect(parsed.header).toBeNull();
+    expect(parsed.body).toBe(malformed);
+  });
+
+  it("falls back to full text on an unknown envelope version", () => {
+    const future =
+      `<!-- harness-envelope v2 stage="design" sessionId="s" workId="w" artifactId="a" createdAt="t" bodyLength="9" -->\nReal body.`;
+    const parsed = parseEnvelope(future);
+    expect(parsed.header).toBeNull();
+    expect(parsed.body).toBe(future);
+  });
+
+  it("falls back to full text when free text merely resembles a header", () => {
+    const lookalike = `<!-- harness-envelope v1 -->\nReal body.`;
+    const parsed = parseEnvelope(lookalike);
+    expect(parsed.header).toBeNull();
+    expect(parsed.body).toBe(lookalike);
+  });
+});
+
+/**
+ * Slice D bootstrap (change harness-operability, task D.1 RED).
+ *
+ * Pure-renderer tests for `renderBootstrapBlock`: the whole block stays
+ * within `BOOTSTRAP_MAX_CHARS`, the embedded summary within
+ * `BOOTSTRAP_SUMMARY_MAX_CHARS` with an explicit truncation marker, small
+ * sessions render complete with no marker, and the block carries the session
+ * id, primary workspace, works, latest summary, next action, and the static
+ * bilingual trigger hints.
+ */
+describe("slice D bootstrap block (pure capped renderer)", () => {
+  it("pins the bootstrap caps beside the existing store caps", () => {
+    expect(BOOTSTRAP_MAX_CHARS).toBe(2000);
+    expect(BOOTSTRAP_SUMMARY_MAX_CHARS).toBe(500);
+  });
+
+  it("renders a small session complete with no truncation marker", () => {
+    const block = renderBootstrapBlock({
+      sessionId: "11111111-1111-4111-8111-111111111111",
+      primaryWorkspace: "/tmp/root-a",
+      works: [{ id: "22222222-2222-4222-8222-222222222222", changeId: "change-1" }],
+      latestSummary: "spec checkpoint summary",
+      next: "design",
+    });
+    expect(block.length).toBeLessThanOrEqual(BOOTSTRAP_MAX_CHARS);
+    expect(block).toContain("session: 11111111-1111-4111-8111-111111111111");
+    expect(block).toContain("primaryWorkspace: /tmp/root-a");
+    expect(block).toContain("22222222-2222-4222-8222-222222222222");
+    expect(block).toContain("change-1");
+    expect(block).toContain("spec checkpoint summary");
+    expect(block).toContain("next: design");
+    expect(block).not.toMatch(/… \[truncated \d+ chars\]/);
+  });
+
+  it("caps an oversized summary at 500 chars with an explicit marker", () => {
+    const summary = "s".repeat(1200);
+    const block = renderBootstrapBlock({
+      sessionId: "s",
+      primaryWorkspace: "/tmp/root-a",
+      works: [],
+      latestSummary: summary,
+      next: "explore",
+    });
+    expect(block.length).toBeLessThanOrEqual(BOOTSTRAP_MAX_CHARS);
+    expect(block).toContain(`… [truncated 700 chars]`);
+    const summaryLine = block
+      .split("\n")
+      .find((line) => line.startsWith("latestSummary: "));
+    expect(summaryLine).toBeDefined();
+    expect(summaryLine!.length).toBeLessThanOrEqual(
+      "latestSummary: ".length + BOOTSTRAP_SUMMARY_MAX_CHARS + "… [truncated 700 chars]".length,
+    );
+    expect(summaryLine).toContain("s".repeat(BOOTSTRAP_SUMMARY_MAX_CHARS));
+  });
+
+  it("caps the whole block at 2000 chars with an explicit marker", () => {
+    const works = Array.from({ length: 60 }, (_, index) => ({
+      id: `work-${index}-22222222-2222-4222-8222-222222222222`,
+      changeId: `change-${index}`,
+    }));
+    const block = renderBootstrapBlock({
+      sessionId: "s",
+      primaryWorkspace: "/tmp/root-a",
+      works,
+      latestSummary: "short summary",
+      next: "explore",
+    });
+    expect(block.length).toBeLessThanOrEqual(BOOTSTRAP_MAX_CHARS);
+    expect(block).toMatch(/… \[truncated \d+ chars\]/);
+  });
+
+  it("renders empty works and a missing summary without a marker", () => {
+    const block = renderBootstrapBlock({
+      sessionId: "s",
+      primaryWorkspace: "/tmp/root-a",
+      works: [],
+      latestSummary: null,
+      next: "explore",
+    });
+    expect(block).toContain("works: (none)");
+    expect(block).toContain("latestSummary: (none)");
+    expect(block).not.toMatch(/… \[truncated \d+ chars\]/);
+  });
+
+  it("carries the static bilingual natural-trigger hints", () => {
+    const block = renderBootstrapBlock({
+      sessionId: "s",
+      primaryWorkspace: "/tmp/root-a",
+      works: [],
+      latestSummary: null,
+      next: "explore",
+    });
+    expect(block).toContain("nuevo trabajo");
+    expect(block).toContain("work_start");
+    expect(block).toContain("continúa la sesión anterior");
+    expect(block).toContain("session_resume");
+  });
+});
+
+/**
+ * Slice D bootstrap wiring (change harness-operability, task D.3 RED).
+ *
+ * `session_start` and `session_resume` append the capped block from
+ * `renderBootstrapBlock` to their existing text output (JSON continuation
+ * from Slice C unaffected). A tokenless turn carrying trigger-like text
+ * still attaches to nothing.
+ */
+describe("slice D bootstrap block on start/resume", () => {
+  let sandbox: string;
+  let rootA: string;
+  let dbPath: string;
+
+  interface HarnessClient {
+    client: Client;
+    server: McpServer;
+  }
+
+  interface ToolResponse {
+    text: string;
+    isError: boolean;
+  }
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(path.join(tmpdir(), "workspace-mcp-bootstrap-"));
+    rootA = path.join(sandbox, "root-a");
+    await mkdir(rootA, { recursive: true });
+    dbPath = path.join(sandbox, "harness.db");
+  });
+
+  afterEach(async () => {
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  async function connectWithHarness(): Promise<HarnessClient> {
+    const store = openHarnessStore({ dbPath, workspaceRoots: [rootA] });
+    store.open();
+    const server = (createServer as (...args: unknown[]) => McpServer)({
+      workspaces: [{ name: "alpha", path: rootA }],
+      defaultWorkspace: "alpha",
+      version: "test",
+      harness: { session: true, store },
+    } as unknown);
+    const client = new Client({ name: "workspace-mcp-bootstrap-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    (server as unknown as { __harnessStore?: HarnessStore }).__harnessStore = store;
+    return { client, server };
+  }
+
+  async function closeHarness(session: HarnessClient): Promise<void> {
+    await session.client.close().catch(() => undefined);
+    await session.server.close().catch(() => undefined);
+    (session.server as unknown as { __harnessStore?: HarnessStore }).__harnessStore?.close();
+  }
+
+  async function callTool(
+    session: HarnessClient,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<ToolResponse> {
+    const result = await session.client.callTool({ name, arguments: args });
+    const content = (result.content ?? []) as Array<{ type: string; text?: string }>;
+    const text = content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text ?? "")
+      .join("\n");
+    return { text, isError: result.isError === true };
+  }
+
+  function firstLine(text: string): string {
+    return (text.split("\n")[0] ?? "").trim();
+  }
+
+  it("appends the bootstrap block to session_start text with the token first", async () => {
+    const session = await connectWithHarness();
+    try {
+      const started = await callTool(session, "session_start", { workspace: "alpha" });
+      expect(started.isError).toBe(false);
+      expect(firstLine(started.text)).toMatch(UUID_RE);
+      expect(started.text).toContain("works: (none)");
+      expect(started.text).toContain("latestSummary: (none)");
+      expect(started.text).toContain("next: explore");
+      expect(started.text).toContain("nuevo trabajo");
+      expect(started.text).toContain("continúa la sesión anterior");
+      expect(started.text).not.toMatch(/… \[truncated \d+ chars\]/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("appends the block to session_resume text with works, summary, and next", async () => {
+    const session = await connectWithHarness();
+    try {
+      const sessionToken = firstLine((await callTool(session, "session_start", {})).text);
+      const workToken = firstLine(
+        (await callTool(session, "work_start", { session: sessionToken, changeId: "change-1" })).text,
+      );
+      const staged = await callTool(session, "stage_write", {
+        session: sessionToken,
+        work: workToken,
+        stage: "spec",
+        body: "spec body for bootstrap",
+      });
+      expect(staged.isError).toBe(false);
+      const checked = await callTool(session, "checkpoint", {
+        session: sessionToken,
+        work: workToken,
+        completedStage: "spec",
+        artifactId: firstLine(staged.text),
+        summary: "spec checkpoint summary",
+      });
+      expect(checked.isError).toBe(false);
+      const resumed = await callTool(session, "session_resume", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(resumed.isError).toBe(false);
+      expect(resumed.text).toContain(`session: ${sessionToken}`);
+      expect(resumed.text).toContain(workToken);
+      expect(resumed.text).toContain("change-1");
+      expect(resumed.text).toContain("spec checkpoint summary");
+      expect(resumed.text).toContain("next: design");
+      expect(resumed.text).toContain("nuevo trabajo");
+      expect(resumed.text).not.toMatch(/… \[truncated \d+ chars\]/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("marks a truncated oversized summary in session_resume output", async () => {
+    const session = await connectWithHarness();
+    try {
+      const sessionToken = firstLine((await callTool(session, "session_start", {})).text);
+      const workToken = firstLine(
+        (await callTool(session, "work_start", { session: sessionToken })).text,
+      );
+      const staged = await callTool(session, "stage_write", {
+        session: sessionToken,
+        work: workToken,
+        stage: "spec",
+        body: "spec body for oversized bootstrap",
+      });
+      expect(staged.isError).toBe(false);
+      const checked = await callTool(session, "checkpoint", {
+        session: sessionToken,
+        work: workToken,
+        completedStage: "spec",
+        artifactId: firstLine(staged.text),
+        summary: "s".repeat(1200),
+      });
+      expect(checked.isError).toBe(false);
+      const resumed = await callTool(session, "session_resume", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(resumed.isError).toBe(false);
+      expect(resumed.text).toContain("… [truncated 700 chars]");
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("attaches a tokenless trigger-text turn to nothing", async () => {
+    const session = await connectWithHarness();
+    try {
+      const tokenless = await callTool(session, "session_resume", {});
+      expect(tokenless.isError).toBe(true);
+      expect(tokenless.text).toMatch(/session/i);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+});
+
+/**
+ * Slice E lifecycle v2 (change harness-operability, task E.1 RED).
+ *
+ * Store-level contract: a second `session_end` still rejects; every write
+ * (work, stage artifact, task list, checkpoint) against an ended session
+ * rejects with the existing `closed-session` code plus a `session_reopen`
+ * hint; `resume` on an ended session returns read-only data (never throws,
+ * never marks live); `deriveSessionState` labels freshly ended sessions
+ * `idle` and sessions ended longer than `ARCHIVED_AFTER_DAYS` ago
+ * `archived`; `reopenSession` revives explicitly with a notice while keeping
+ * `ended_at` and setting `reopened_at`; `purgeExpiredSessions` stays on the
+ * `ended_at` 90-day rule with live sessions (including reopened ones) never
+ * purged.
+ *
+ * NOTE: this supersedes the hard-close contract pinned by "closes sessions
+ * explicitly and never revives them" and "reports closed sessions without
+ * reviving them" above — `resume` no longer throws on ended sessions. Those
+ * two tests are migrated at GREEN step E.2.
+ */
+describe("slice E lifecycle v2: ended writes reject, reads snapshot, reopen is explicit (store)", () => {
+  let sandbox: string;
+  let rootA: string;
+  let rootB: string;
+  let dbPath: string;
+  let store: HarnessStore | null = null;
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(path.join(tmpdir(), "workspace-mcp-lifecycle-"));
+    rootA = path.join(sandbox, "root-a");
+    rootB = path.join(sandbox, "root-b");
+    await mkdir(rootA, { recursive: true });
+    await mkdir(rootB, { recursive: true });
+    dbPath = path.join(sandbox, "harness.db");
+    store = openHarnessStore({ dbPath, workspaceRoots: [rootA, rootB] });
+    store.open();
+  });
+
+  afterEach(async () => {
+    store?.close();
+    store = null;
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  function active(): HarnessStore {
+    if (store === null) {
+      throw new Error("store not open");
+    }
+    return store;
+  }
+
+  function seedEndedSession(): { sessionId: string; workId: string } {
+    const session = active().startSession(rootA);
+    const work = active().startWork(session.id, rootA, "change-1");
+    const artifact = active().writeStageArtifact({
+      sessionId: session.id,
+      workId: work.id,
+      workspace: rootA,
+      changeId: "change-1",
+      stage: "spec",
+      body: "spec body for lifecycle",
+    });
+    active().checkpoint({
+      sessionId: session.id,
+      workId: work.id,
+      workspace: rootA,
+      changeId: "change-1",
+      completedStage: "spec",
+      artifactId: artifact.id,
+      summary: "spec checkpoint summary",
+    });
+    active().endSession(session.id);
+    return { sessionId: session.id, workId: work.id };
+  }
+
+  function closedSessionCode(action: () => unknown): string {
+    try {
+      action();
+    } catch (error) {
+      return (error as HarnessStoreError).code;
+    }
+    throw new Error("expected a closed-session rejection");
+  }
+
+  it("still rejects a second session_end on an ended session", () => {
+    const session = active().startSession(rootA);
+    active().endSession(session.id);
+    expect(closedSessionCode(() => active().endSession(session.id))).toBe("closed-session");
+  });
+
+  it("rejects writes against an ended session with the closed-session code plus a session_reopen hint", () => {
+    const { sessionId, workId } = seedEndedSession();
+    const attempts: Array<() => unknown> = [
+      () => active().startWork(sessionId, rootA, "change-2"),
+      () =>
+        active().writeStageArtifact({
+          sessionId,
+          workId,
+          workspace: rootA,
+          changeId: "change-1",
+          stage: "design",
+          body: "design body after end",
+        }),
+      () =>
+        active().writeTaskList({
+          sessionId,
+          workId,
+          workspace: rootA,
+          changeId: "change-1",
+          body: "- [ ] task after end",
+          supersedes: null,
+        }),
+      () =>
+        active().checkpoint({
+          sessionId,
+          workId,
+          workspace: rootA,
+          changeId: "change-1",
+          completedStage: "spec",
+          artifactId: "00000000-0000-4000-8000-000000000000",
+          summary: "checkpoint after end",
+        }),
+    ];
+    expect(attempts.length).toBe(4);
+    for (const attempt of attempts) {
+      let error: unknown;
+      try {
+        attempt();
+      } catch (cause) {
+        error = cause;
+      }
+      expect(error).toBeInstanceOf(HarnessStoreError);
+      expect((error as HarnessStoreError).code).toBe("closed-session");
+      expect((error as HarnessStoreError).message).toMatch(/session_reopen/);
+    }
+  });
+
+  it("returns ended resume data without marking the session live", () => {
+    const { sessionId, workId } = seedEndedSession();
+    const resumed = active().resume(sessionId, workId);
+    expect(resumed.session.id).toBe(sessionId);
+    expect(resumed.latestCheckpoint?.summary).toBe("spec checkpoint summary");
+    expect(deriveSessionState(resumed.session)).toBe("idle");
+    expect(closedSessionCode(() => active().startWork(sessionId, rootA))).toBe(
+      "closed-session",
+    );
+  });
+
+  it("labels ended sessions idle, then archived past ARCHIVED_AFTER_DAYS", () => {
+    expect(ARCHIVED_AFTER_DAYS).toBe(30);
+    const session = active().startSession(rootA);
+    active().endSession(session.id);
+    expect(deriveSessionState(active().resume(session.id).session)).toBe("idle");
+    // Age the first-ended audit timestamp past the threshold with a raw
+    // update (the store never rewrites ended_at itself), then read the label
+    // through a fresh store instance.
+    active().close();
+    const raw = new DatabaseSync(dbPath);
+    try {
+      raw
+        .prepare("UPDATE sessions SET ended_at = ? WHERE id = ?")
+        .run(new Date(Date.now() - 31 * 86400000).toISOString(), session.id);
+    } finally {
+      raw.close();
+    }
+    const aged = openHarnessStore({ dbPath, workspaceRoots: [rootA] });
+    aged.open();
+    try {
+      expect(deriveSessionState(aged.resume(session.id).session)).toBe("archived");
+    } finally {
+      aged.close();
+    }
+    store = openHarnessStore({ dbPath, workspaceRoots: [rootA, rootB] });
+    store.open();
+  });
+
+  it("reopens explicitly with a notice while keeping ended_at and setting reopened_at", () => {
+    const { sessionId } = seedEndedSession();
+    const before = active().resume(sessionId).session;
+    expect(before.endedAt).not.toBeNull();
+    const reopened = active().reopenSession(sessionId);
+    expect(reopened.notice).toMatch(/ended.*reopened/i);
+    expect(reopened.session.endedAt).toBe(before.endedAt);
+    expect(reopened.session.reopenedAt).not.toBeNull();
+    expect(deriveSessionState(reopened.session)).toBe("live");
+    const work = active().startWork(sessionId, rootA, "change-2");
+    expect(work.sessionId).toBe(sessionId);
+  });
+
+  it("keeps purge on the ended_at 90-day rule with live sessions never purged", () => {
+    const live = active().startSession(rootA);
+    const { sessionId: endedId } = seedEndedSession();
+    const reopened = active().startSession(rootA);
+    active().endSession(reopened.id);
+    active().reopenSession(reopened.id);
+    const purged = active().purgeExpiredSessions(
+      new Date(Date.now() + 120 * 86400000).toISOString(),
+    );
+    expect(purged).toContain(endedId);
+    expect(purged).not.toContain(live.id);
+    expect(purged).not.toContain(reopened.id);
+    expect(deriveSessionState(active().resume(reopened.id).session)).toBe("live");
+  });
+});
+
+/**
+ * Slice E lifecycle v2 over the transport (change harness-operability, task
+ * E.1 RED): `session_resume`/`harness_status` on ended sessions return
+ * read-only snapshots (state, latest checkpoint, derived next, reopen
+ * guidance) instead of throwing; `session_resume` without `session_reopen`
+ * never marks the session live; `session_reopen` returns the explicit
+ * ended-then-reopened notice and restores writes.
+ */
+describe("slice E lifecycle v2 over the transport: snapshots and session_reopen", () => {
+  let sandbox: string;
+  let rootA: string;
+  let dbPath: string;
+
+  interface HarnessClient {
+    client: Client;
+    server: McpServer;
+  }
+
+  interface ToolResponse {
+    text: string;
+    isError: boolean;
+  }
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(path.join(tmpdir(), "workspace-mcp-lifecycle-transport-"));
+    rootA = path.join(sandbox, "root-a");
+    await mkdir(rootA, { recursive: true });
+    dbPath = path.join(sandbox, "harness.db");
+  });
+
+  afterEach(async () => {
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  async function connectWithHarness(): Promise<HarnessClient> {
+    const store = openHarnessStore({ dbPath, workspaceRoots: [rootA] });
+    store.open();
+    const server = (createServer as (...args: unknown[]) => McpServer)({
+      workspaces: [{ name: "alpha", path: rootA }],
+      defaultWorkspace: "alpha",
+      version: "test",
+      harness: { session: true, store },
+    } as unknown);
+    const client = new Client({ name: "workspace-mcp-lifecycle-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    (server as unknown as { __harnessStore?: HarnessStore }).__harnessStore = store;
+    return { client, server };
+  }
+
+  async function closeHarness(session: HarnessClient): Promise<void> {
+    await session.client.close().catch(() => undefined);
+    await session.server.close().catch(() => undefined);
+    (session.server as unknown as { __harnessStore?: HarnessStore }).__harnessStore?.close();
+  }
+
+  async function callTool(
+    session: HarnessClient,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<ToolResponse> {
+    const result = await session.client.callTool({ name, arguments: args });
+    const content = (result.content ?? []) as Array<{ type: string; text?: string }>;
+    const text = content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text ?? "")
+      .join("\n");
+    return { text, isError: result.isError === true };
+  }
+
+  function firstLine(text: string): string {
+    return (text.split("\n")[0] ?? "").trim();
+  }
+
+  async function startSeededSession(session: HarnessClient): Promise<{
+    sessionToken: string;
+    workToken: string;
+  }> {
+    const started = await callTool(session, "session_start", { workspace: "alpha" });
+    expect(started.isError).toBe(false);
+    const sessionToken = firstLine(started.text);
+    const workStarted = await callTool(session, "work_start", {
+      session: sessionToken,
+      workspace: "alpha",
+      changeId: "change-1",
+    });
+    expect(workStarted.isError).toBe(false);
+    const workToken = firstLine(workStarted.text);
+    const staged = await callTool(session, "stage_write", {
+      session: sessionToken,
+      work: workToken,
+      workspace: "alpha",
+      stage: "spec",
+      body: "spec body for lifecycle snapshots",
+    });
+    expect(staged.isError).toBe(false);
+    const checked = await callTool(session, "checkpoint", {
+      session: sessionToken,
+      work: workToken,
+      workspace: "alpha",
+      completedStage: "spec",
+      artifactId: firstLine(staged.text),
+      summary: "spec checkpoint summary",
+    });
+    expect(checked.isError).toBe(false);
+    const ended = await callTool(session, "session_end", { session: sessionToken });
+    expect(ended.isError).toBe(false);
+    return { sessionToken, workToken };
+  }
+
+  it("still rejects a second session_end on an ended session", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken } = await startSeededSession(session);
+      const second = await callTool(session, "session_end", { session: sessionToken });
+      expect(second.isError).toBe(true);
+      expect(second.text).toMatch(/closed-session/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("rejects writes against an ended session with a session_reopen hint", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededSession(session);
+      const write = await callTool(session, "stage_write", {
+        session: sessionToken,
+        work: workToken,
+        workspace: "alpha",
+        stage: "design",
+        body: "design body after end",
+      });
+      expect(write.isError).toBe(true);
+      expect(write.text).toMatch(/closed-session/);
+      expect(write.text).toMatch(/session_reopen/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("serves session_resume as a read-only snapshot with reopen guidance", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededSession(session);
+      const resumed = await callTool(session, "session_resume", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(resumed.isError).toBe(false);
+      expect(resumed.text).toContain("state: idle");
+      expect(resumed.text).toContain("spec checkpoint summary");
+      expect(resumed.text).toContain("next: design");
+      expect(resumed.text).toMatch(/session_reopen/);
+      expect(resumed.text).not.toContain("nuevo trabajo");
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("serves harness_status as a read-only snapshot with reopen guidance", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededSession(session);
+      const status = await callTool(session, "harness_status", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(status.isError).toBe(false);
+      expect(status.text).toContain("state: idle");
+      expect(status.text).toContain("spec checkpoint summary");
+      expect(status.text).toContain("next: design");
+      expect(status.text).toMatch(/session_reopen/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("never marks an ended session live through resume", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededSession(session);
+      const resumed = await callTool(session, "session_resume", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(resumed.isError).toBe(false);
+      const write = await callTool(session, "stage_write", {
+        session: sessionToken,
+        work: workToken,
+        workspace: "alpha",
+        stage: "design",
+        body: "design body without reopen",
+      });
+      expect(write.isError).toBe(true);
+      expect(write.text).toMatch(/closed-session/);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("reopens through session_reopen with an explicit notice and restores writes", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededSession(session);
+      const reopened = await callTool(session, "session_reopen", {
+        session: sessionToken,
+      });
+      expect(reopened.isError).toBe(false);
+      expect(reopened.text).toMatch(/ended.*reopened/i);
+      const write = await callTool(session, "stage_write", {
+        session: sessionToken,
+        work: workToken,
+        workspace: "alpha",
+        stage: "design",
+        body: "design body after reopen",
+      });
+      expect(write.isError).toBe(false);
+    } finally {
+      await closeHarness(session);
     }
   });
 });

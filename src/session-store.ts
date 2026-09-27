@@ -71,6 +71,119 @@ export const HARNESS_STAGES = [
 
 export type HarnessStage = (typeof HARNESS_STAGES)[number];
 
+/**
+ * Slice C continuation (change harness-operability): single-source per-stage
+ * contract table co-located with the canonical ordered stage list. Each stage
+ * maps to the operator actions (real registered harness tool names) allowed
+ * there plus the artifact that records the stage outcome. A drift test in
+ * `test/harness-wiring.test.ts` asserts the keys equal `HARNESS_STAGES`
+ * exactly and every named action is a registered tool, so tool-surface
+ * changes without a table update fail the suite. The envelope carries
+ * actions only, never measured compliance or metric values.
+ */
+export const HARNESS_STAGE_CONTRACTS: Record<
+  HarnessStage,
+  { readonly allowedActions: readonly string[]; readonly artifact: string }
+> = {
+  explore: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status"],
+    artifact: "exploration note",
+  },
+  propose: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status"],
+    artifact: "proposal",
+  },
+  spec: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status"],
+    artifact: "delta specs",
+  },
+  design: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status"],
+    artifact: "design",
+  },
+  tasks: {
+    allowedActions: ["task_write", "stage_write", "checkpoint", "harness_status"],
+    artifact: "task list",
+  },
+  apply: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status"],
+    artifact: "apply record",
+  },
+  verify: {
+    allowedActions: ["stage_write", "checkpoint", "harness_status", "session_end"],
+    artifact: "verification report",
+  },
+};
+
+/** Version of the opt-in JSON continuation envelope (Slice C). */
+export const CONTINUATION_ENVELOPE_VERSION = 1 as const;
+
+/** Cap for the checkpoint summary embedded in the JSON envelope. */
+export const CONTINUATION_CHECKPOINT_SUMMARY_MAX_CHARS = 2000;
+
+/**
+ * Opt-in machine-readable continuation payload (Slice C). Carries `next`,
+ * `reason`, the per-stage allowed-actions table, and a capped checkpoint
+ * reference — and NO metric values. Built from the single
+ * `store.harnessStatus()` derivation, so `json` stays consistent with the
+ * default `text` output by construction.
+ */
+export interface ContinuationEnvelope {
+  version: 1;
+  next: string;
+  reason: string;
+  perStage: Array<{ stage: string; allowedActions: string[]; artifact: string }>;
+  latestCheckpoint: {
+    seq: number;
+    completedStage: string;
+    artifactId: string;
+    summary: string;
+    truncated: boolean;
+  } | null;
+}
+
+/**
+ * Shapes a `harnessStatus()` result into the versioned capped JSON envelope.
+ * Oversized checkpoint summaries are truncated with an explicit
+ * `… [truncated N chars]` marker (never a silent mid-JSON cut) so the
+ * payload stays well-formed and parseable.
+ */
+export function buildContinuationEnvelope(status: HarnessStatusResult): ContinuationEnvelope {
+  const checkpoint = status.latestCheckpoint;
+  return {
+    version: CONTINUATION_ENVELOPE_VERSION,
+    next: status.next,
+    reason: status.reason,
+    perStage: (HARNESS_STAGES as readonly HarnessStage[]).map((stage) => ({
+      stage,
+      allowedActions: [...HARNESS_STAGE_CONTRACTS[stage].allowedActions],
+      artifact: HARNESS_STAGE_CONTRACTS[stage].artifact,
+    })),
+    latestCheckpoint:
+      checkpoint === null
+        ? null
+        : {
+            seq: checkpoint.seq,
+            completedStage: checkpoint.completedStage,
+            artifactId: checkpoint.artifactId,
+            summary: capCheckpointSummary(checkpoint.summary).text,
+            truncated: capCheckpointSummary(checkpoint.summary).truncated,
+          },
+  };
+}
+
+/** Caps an embedded checkpoint summary with an explicit truncation marker. */
+function capCheckpointSummary(summary: string): { text: string; truncated: boolean } {
+  if (summary.length <= CONTINUATION_CHECKPOINT_SUMMARY_MAX_CHARS) {
+    return { text: summary, truncated: false };
+  }
+  const removed = summary.length - CONTINUATION_CHECKPOINT_SUMMARY_MAX_CHARS;
+  return {
+    text: `${summary.slice(0, CONTINUATION_CHECKPOINT_SUMMARY_MAX_CHARS)}… [truncated ${removed} chars]`,
+    truncated: true,
+  };
+}
+
 /** Recall/hardening bounds (Slice 3, task 4.5 decision record). */
 export const MAX_STAGE_BODY_CHARS = 100000;
 export const MAX_TASK_BODY_CHARS = 100000;
@@ -79,6 +192,122 @@ export const DEFAULT_RECALL_LIMIT = 20;
 export const MAX_RECALL_LIMIT = 50;
 /** Ended sessions older than this are eligible for explicit purge. */
 export const SESSION_RETENTION_DAYS = 90;
+
+/**
+ * Slice E lifecycle v2 (change harness-operability): read-time threshold for
+ * the `idle` → `archived` label. Adopted verbatim from design at Slice E
+ * apply with no operator available in the turn — this recorded constant IS
+ * the confirmation artifact; flag in review if the threshold must change.
+ * Ask-on-risk pause point, recorded in apply-progress.
+ */
+export const ARCHIVED_AFTER_DAYS = 30;
+
+/** Read-time lifecycle label for a session (Slice E). */
+export type HarnessSessionState = "live" | "idle" | "archived";
+
+/**
+ * Derives the read-time lifecycle label from a session record. `live` while
+ * `status` is `'live'`; otherwise `idle`, or `archived` once the session has
+ * been ended longer than `ARCHIVED_AFTER_DAYS`. Archived is a label, not a
+ * persisted transition — both ended labels are terminal for writes.
+ */
+export function deriveSessionState(record: SessionRecord): HarnessSessionState {
+  if (record.status === "live") {
+    return "live";
+  }
+  if (record.endedAt === null) {
+    return "idle";
+  }
+  const ageMs = Date.now() - new Date(record.endedAt).getTime();
+  return ageMs > ARCHIVED_AFTER_DAYS * 86400000 ? "archived" : "idle";
+}
+
+/**
+ * Slice D bootstrap (change harness-operability): hard caps for the dynamic
+ * bootstrap block returned by `session_start`/`session_resume`. Whole block
+ * at most 2000 chars with the embedded latest-checkpoint summary at most 500
+ * chars; any truncation carries an explicit `… [truncated N chars]` marker
+ * and never cuts silently. Config file untouched; constants first.
+ */
+export const BOOTSTRAP_MAX_CHARS = 2000;
+export const BOOTSTRAP_SUMMARY_MAX_CHARS = 500;
+
+/**
+ * Slice A envelope (change harness-operability): versioned single-line
+ * HTML-comment header carried inline in `stage_artifacts.body`.
+ *
+ * Delimiter wording is a compatibility surface, recorded at Slice A apply:
+ * `<!-- harness-envelope v1 stage="…" sessionId="…" workId="…" artifactId="…"
+ * createdAt="…" bodyLength="…" -->`. `bodyLength` counts free-body characters
+ * only (header excluded). Parsing never throws: any unknown or malformed
+ * first line falls back to the full stored text with `header: null`, trusting
+ * no header field. `bodyLength` is descriptive metadata and is not
+ * re-validated on parse; row columns stay authoritative for identity.
+ */
+export const ENVELOPE_VERSION = 1 as const;
+
+export interface EnvelopeHeader {
+  stage: string;
+  sessionId: string;
+  workId: string;
+  artifactId: string;
+  createdAt: string;
+  bodyLength: number;
+}
+
+const ENVELOPE_PATTERN =
+  /^<!-- harness-envelope v1 stage="([^"]*)" sessionId="([^"]*)" workId="([^"]*)" artifactId="([^"]*)" createdAt="([^"]*)" bodyLength="(\d+)" -->$/;
+
+/** Prepends the versioned header line to a free body (header excluded from `bodyLength`). */
+export function emitEnvelope(
+  header: Omit<EnvelopeHeader, "bodyLength">,
+  body: string,
+): string {
+  const firstLine =
+    `<!-- harness-envelope v${ENVELOPE_VERSION} stage="${header.stage}" ` +
+    `sessionId="${header.sessionId}" workId="${header.workId}" ` +
+    `artifactId="${header.artifactId}" createdAt="${header.createdAt}" ` +
+    `bodyLength="${body.length}" -->`;
+  return `${firstLine}\n${body}`;
+}
+
+/**
+ * Splits stored text into header + free body. Malformed or unknown first
+ * lines (including pre-change bodies with no header) return the full stored
+ * text with `header: null`.
+ */
+export function parseEnvelope(stored: string):
+  | { header: EnvelopeHeader; body: string }
+  | { header: null; body: string } {
+  const newline = stored.indexOf("\n");
+  const firstLine = (newline === -1 ? stored : stored.slice(0, newline)).replace(/\r$/, "");
+  const match = ENVELOPE_PATTERN.exec(firstLine);
+  if (match === null) {
+    return { header: null, body: stored };
+  }
+  const [, stage, sessionId, workId, artifactId, createdAt, rawLength] = match;
+  if (
+    stage === undefined ||
+    sessionId === undefined ||
+    workId === undefined ||
+    artifactId === undefined ||
+    createdAt === undefined ||
+    rawLength === undefined
+  ) {
+    return { header: null, body: stored };
+  }
+  return {
+    header: {
+      stage,
+      sessionId,
+      workId,
+      artifactId,
+      createdAt,
+      bodyLength: Number(rawLength),
+    },
+    body: newline === -1 ? "" : stored.slice(newline + 1),
+  };
+}
 
 export type HarnessStoreErrorCode =
   | "unknown-session"
@@ -116,6 +345,19 @@ export interface SessionRecord {
   id: string;
   createdAt: string;
   endedAt: string | null;
+  /**
+   * Slice E lifecycle v2: persisted liveness. `'live'` for writable
+   * sessions, `'idle'` once ended. `archived` is a read-time label from
+   * {@link deriveSessionState}, never persisted.
+   */
+  status: "live" | "idle";
+  /**
+   * Slice E lifecycle v2: audit timestamp of the last explicit
+   * `session_reopen`, or null when never reopened. `endedAt` keeps the
+   * first-ended timestamp, so reopened sessions stay distinguishable from
+   * never-closed ones.
+   */
+  reopenedAt: string | null;
   /** Canonical (realpath) registered workspace bound at start. */
   primaryWorkspace: string;
 }
@@ -191,7 +433,50 @@ export interface HarnessStatusResult {
    * checkpoint: the transition is reported honestly and never gates progress.
    */
   unverified: boolean;
+  /**
+   * Slice E lifecycle v2: read-time lifecycle label of the queried session.
+   * Handlers shape read-only snapshots for ended sessions from this instead
+   * of throwing.
+   */
+  state: HarnessSessionState;
 }
+
+/**
+ * Slice B metrics (change harness-operability): read-only operator-local
+ * snapshot over already-stored rows. Six deterministic signals computed with
+ * SELECT-only queries (zero writes); advisory only, never gates.
+ */
+export interface MetricsSnapshot {
+  /** Share of stage artifacts carrying at least one checkpoint. */
+  coverage: { withCheckpoint: number; total: number };
+  /**
+   * Checkpoint stage sequence per work compared against the canonical
+   * ordered stage list. Forward jumps are permitted (operator may proceed
+   * out of order with visibility); backward or repeated transitions count
+   * as bypasses.
+   */
+  order: { compliant: number; total: number; bypasses: number };
+  /** Counts of live versus ended sessions plus the oldest live session age. */
+  hygiene: { live: number; ended: number; oldestLiveAgeMs: number | null };
+  /** Time deltas between consecutive checkpoints per work item. */
+  cadenceMs: Array<{ workId: string; deltasMs: number[] }>;
+  /** Repeated checkpoints for the same stage on the same work item. */
+  rework: Array<{ workId: string; stage: string; count: number }>;
+  /** Task-row counts per work item. */
+  taskUsage: Array<{ workId: string; taskRows: number }>;
+  /** Always present: advisory + gameable, never gates. */
+  advisoryCaveat: string;
+}
+
+/**
+ * Advisory caveat carried by every metrics snapshot and every rendering of
+ * it. Names the gaming risk explicitly so perfect scores are never read as
+ * proof of diligence.
+ */
+export const METRICS_ADVISORY_CAVEAT =
+  "Advisory only: harness health signals are gameable — perfect order and " +
+  "coverage can coexist with rubber-stamped stages. Never use these figures " +
+  "as execution gates.";
 
 export interface RecallScope {
   /** Explicit session token; REQUIRED on every harness FTS query. */
@@ -218,6 +503,19 @@ export interface HarnessStore {
     work: WorkRecord | null;
     latestCheckpoint: CheckpointRecord | null;
   };
+  /**
+   * Slice D bootstrap (change harness-operability): every work item bound to
+   * a session, oldest first, for the capped bootstrap block. Read-only.
+   */
+  listWorks(sessionId: string): WorkRecord[];
+  /**
+   * Slice E lifecycle v2 (change harness-operability): the ONLY path reviving
+   * an ended session. Sets `status = 'live'` and `reopened_at = now()` while
+   * keeping `ended_at` as the first-ended audit timestamp, and returns an
+   * explicit ended-then-reopened notice. Reopening a live session is a no-op
+   * success that records nothing.
+   */
+  reopenSession(sessionId: string): { session: SessionRecord; notice: string };
   writeStageArtifact(input: Omit<StageArtifactRecord, "id" | "createdAt">): StageArtifactRecord;
   readStageArtifact(
     artifactId: string,
@@ -227,6 +525,12 @@ export interface HarnessStore {
   readTaskList(taskId: string, opts: { sessionId: string; workId?: string }): HarnessTaskRecord;
   checkpoint(input: Omit<CheckpointRecord, "seq" | "createdAt">): CheckpointRecord;
   harnessStatus(sessionId: string, workId?: string): HarnessStatusResult;
+  /**
+   * Slice B metrics (change harness-operability): SELECT-only aggregation
+   * over existing rows returning the six-signal {@link MetricsSnapshot}.
+   * Performs zero writes; an unreachable store throws `store-unavailable`.
+   */
+  getMetricsSnapshot(): MetricsSnapshot;
   /** Scoped recall: session required; work/workspace narrow; never global. */
   searchCheckpoints(query: string, opts: RecallScope): CheckpointRecord[];
   searchStageArtifacts(query: string, opts: RecallScope): StageArtifactRecord[];
@@ -391,7 +695,9 @@ function toStageArtifactRecord(row: StageArtifactRow): StageArtifactRecord {
     workspace: row.workspace,
     changeId: row.change_id,
     stage: row.stage,
-    body: row.body,
+    // Slice A: stored text may carry the envelope header; recall surfaces the
+    // free body. Pre-change rows without a header pass through untouched.
+    body: parseEnvelope(row.body).body,
     createdAt: row.created_at,
   };
 }
@@ -522,6 +828,8 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           id: string;
           created_at: string;
           ended_at: string | null;
+          status?: string | null;
+          reopened_at?: string | null;
           primary_workspace: string;
         }
       | undefined;
@@ -532,14 +840,19 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
       id: row.id,
       createdAt: row.created_at,
       endedAt: row.ended_at,
+      status: row.status === "idle" ? "idle" : "live",
+      reopenedAt: row.reopened_at ?? null,
       primaryWorkspace: row.primary_workspace,
     };
   }
 
   function requireLiveSession(sessionId: string): SessionRecord {
     const session = readSession(sessionId);
-    if (session.endedAt !== null) {
-      throw new HarnessStoreError("closed-session", "session is closed");
+    if (session.status !== "live") {
+      throw new HarnessStoreError(
+        "closed-session",
+        "session is closed; use session_reopen to reopen it",
+      );
     }
     return session;
   }
@@ -602,6 +915,23 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
       mkdirSync(path.dirname(path.resolve(options.dbPath)), { recursive: true });
       db = new DatabaseSync(path.resolve(options.dbPath));
       db.exec(SCHEMA);
+      // Slice E lifecycle v2: idempotent column upgrade so pre-change
+      // databases gain `status`/`reopened_at` in place. Rows ended before the
+      // upgrade carry `ended_at` but no status, so they are backfilled to
+      // `'idle'` exactly once (when the column is added) — never on later
+      // opens, where reopened-live rows must keep `status = 'live'`.
+      // `ended_at` stays the first-ended audit timestamp throughout.
+      const sessionColumns = db
+        .prepare("PRAGMA table_info(sessions)")
+        .all() as Array<{ name: string }>;
+      const sessionColumnNames = new Set(sessionColumns.map((column) => column.name));
+      if (!sessionColumnNames.has("status")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'live'");
+        db.exec("UPDATE sessions SET status = 'idle' WHERE ended_at IS NOT NULL");
+      }
+      if (!sessionColumnNames.has("reopened_at")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN reopened_at TEXT");
+      }
       // Backfill FTS rows for databases written before the Slice 3 triggers
       // existed; the triggers keep every later write in sync.
       db.exec(`
@@ -626,13 +956,22 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           id: randomUUID(),
           createdAt: now(),
           endedAt: null,
+          status: "live",
+          reopenedAt: null,
           primaryWorkspace: canonical,
         };
         requireOpen()
           .prepare(
-            "INSERT INTO sessions(id, created_at, ended_at, primary_workspace) VALUES (?, ?, ?, ?)",
+            "INSERT INTO sessions(id, created_at, ended_at, status, reopened_at, primary_workspace) VALUES (?, ?, ?, ?, ?, ?)",
           )
-          .run(record.id, record.createdAt, record.endedAt, record.primaryWorkspace);
+          .run(
+            record.id,
+            record.createdAt,
+            record.endedAt,
+            record.status,
+            record.reopenedAt,
+            record.primaryWorkspace,
+          );
         return record;
       } catch (error) {
         throw asStoreUnavailable(error);
@@ -642,12 +981,35 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
     endSession(sessionId: string): void {
       try {
         const session = readSession(sessionId);
-        if (session.endedAt !== null) {
+        if (session.status !== "live" || session.endedAt !== null) {
           throw new HarnessStoreError("closed-session", "session is already closed");
         }
         requireOpen()
-          .prepare("UPDATE sessions SET ended_at = ? WHERE id = ?")
+          .prepare("UPDATE sessions SET ended_at = ?, status = 'idle' WHERE id = ?")
           .run(now(), sessionId);
+      } catch (error) {
+        throw asStoreUnavailable(error);
+      }
+    },
+
+    reopenSession(sessionId: string): { session: SessionRecord; notice: string } {
+      try {
+        const session = readSession(sessionId);
+        if (session.status === "live") {
+          return {
+            session,
+            notice: `session ${sessionId} is already live; no reopen was needed`,
+          };
+        }
+        const reopenedAt = now();
+        requireOpen()
+          .prepare("UPDATE sessions SET status = 'live', reopened_at = ? WHERE id = ?")
+          .run(reopenedAt, sessionId);
+        const record: SessionRecord = { ...session, status: "live", reopenedAt };
+        return {
+          session: record,
+          notice: `session ${sessionId} was ended and is now reopened`,
+        };
       } catch (error) {
         throw asStoreUnavailable(error);
       }
@@ -677,10 +1039,10 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
 
     resume(sessionId: string, workId?: string) {
       try {
+        // Slice E lifecycle v2: ended sessions return their read-only data
+        // instead of throwing — the handler shapes the snapshot and the
+        // session stays ended until an explicit `reopenSession`.
         const session = readSession(sessionId);
-        if (session.endedAt !== null) {
-          throw new HarnessStoreError("closed-session", "session is closed");
-        }
         let work: WorkRecord | null = null;
         if (workId !== undefined) {
           work = requireWorkInSession(workId, sessionId);
@@ -711,12 +1073,36 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
       }
     },
 
+    listWorks(sessionId: string): WorkRecord[] {
+      try {
+        readSession(sessionId);
+        const rows = requireOpen()
+          .prepare("SELECT * FROM works WHERE session_id = ? ORDER BY rowid")
+          .all(sessionId) as Array<{
+          id: string;
+          session_id: string;
+          workspace: string;
+          change_id: string | null;
+          created_at: string;
+        }>;
+        return rows.map((row) => ({
+          id: row.id,
+          sessionId: row.session_id,
+          workspace: row.workspace,
+          changeId: row.change_id,
+          createdAt: row.created_at,
+        }));
+      } catch (error) {
+        throw asStoreUnavailable(error);
+      }
+    },
+
     harnessStatus(sessionId: string, workId?: string): HarnessStatusResult {
       try {
+        // Slice E lifecycle v2: ended sessions return the same derivation
+        // with their read-time `state` instead of throwing — the handler
+        // shapes the read-only snapshot from `state`.
         const session = readSession(sessionId);
-        if (session.endedAt !== null) {
-          throw new HarnessStoreError("closed-session", "session is closed");
-        }
         if (workId !== undefined) {
           requireWorkInSession(workId, sessionId);
         }
@@ -784,6 +1170,152 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           reason: reasons.join("; "),
           latestCheckpoint,
           unverified,
+          state: deriveSessionState(session),
+        };
+      } catch (error) {
+        throw asStoreUnavailable(error);
+      }
+    },
+
+    getMetricsSnapshot(): MetricsSnapshot {
+      try {
+        const db = requireOpen();
+        // Coverage: share of stage artifacts carrying at least one checkpoint.
+        const coverageTotal = (
+          db.prepare("SELECT COUNT(*) AS n FROM stage_artifacts").get() as { n: number }
+        ).n;
+        const withCheckpoint = (
+          db
+            .prepare(
+              "SELECT COUNT(*) AS n FROM stage_artifacts WHERE id IN (SELECT DISTINCT artifact_id FROM checkpoints)",
+            )
+            .get() as { n: number }
+        ).n;
+
+        // Order: per-work checkpoint sequence against the canonical ordered
+        // stage list. Forward jumps are permitted; backward or repeated
+        // transitions count as bypasses. Unknown stages cannot be ordered.
+        const orderedCheckpoints = db
+          .prepare(
+            "SELECT work_id, completed_stage FROM checkpoints ORDER BY work_id ASC, seq ASC",
+          )
+          .all() as Array<{ work_id: string; completed_stage: string }>;
+        let orderTotal = 0;
+        let orderCompliant = 0;
+        let orderBypasses = 0;
+        let previousWork: string | null = null;
+        let previousIndex = -1;
+        for (const row of orderedCheckpoints) {
+          if (row.work_id !== previousWork) {
+            previousWork = row.work_id;
+            previousIndex = -1;
+          }
+          orderTotal += 1;
+          const index = (HARNESS_STAGES as readonly string[]).indexOf(row.completed_stage);
+          if (index === -1 || index <= previousIndex) {
+            orderBypasses += 1;
+          } else {
+            orderCompliant += 1;
+            previousIndex = index;
+          }
+        }
+
+        // Hygiene: live versus ended counts plus the oldest live session age.
+        // The age reference is the latest stored event timestamp (max
+        // created_at across all tables), never the wall clock, so consecutive
+        // snapshots of an unchanged store stay byte-identical (determinism
+        // scenario, including CLI double-runs seconds apart).
+        const hygieneRows = db
+          .prepare("SELECT ended_at, created_at FROM sessions")
+          .all() as Array<{ ended_at: string | null; created_at: string }>;
+        let live = 0;
+        let ended = 0;
+        let oldestLiveCreated: number | null = null;
+        for (const row of hygieneRows) {
+          if (row.ended_at !== null) {
+            ended += 1;
+          } else {
+            live += 1;
+            const created = new Date(row.created_at).getTime();
+            if (oldestLiveCreated === null || created < oldestLiveCreated) {
+              oldestLiveCreated = created;
+            }
+          }
+        }
+        const latestEvent = (
+          db
+            .prepare(
+              "SELECT MAX(created_at) AS latest FROM (" +
+                "SELECT created_at FROM sessions UNION ALL " +
+                "SELECT created_at FROM works UNION ALL " +
+                "SELECT created_at FROM stage_artifacts UNION ALL " +
+                "SELECT created_at FROM harness_tasks UNION ALL " +
+                "SELECT created_at FROM checkpoints)",
+            )
+            .get() as { latest: string | null }
+        ).latest;
+        const oldestLiveAgeMs =
+          oldestLiveCreated === null || latestEvent === null
+            ? null
+            : Math.max(0, new Date(latestEvent).getTime() - oldestLiveCreated);
+
+        // Cadence: deltas between consecutive checkpoints per work item.
+        const cadenceRows = db
+          .prepare("SELECT work_id, created_at FROM checkpoints ORDER BY work_id ASC, seq ASC")
+          .all() as Array<{ work_id: string; created_at: string }>;
+        const cadenceMs: MetricsSnapshot["cadenceMs"] = [];
+        let cadenceWork: string | null = null;
+        let cadencePrevious: number | null = null;
+        let cadenceDeltas: number[] = [];
+        const flushCadence = (): void => {
+          if (cadenceWork !== null && cadenceDeltas.length > 0) {
+            cadenceMs.push({ workId: cadenceWork, deltasMs: cadenceDeltas });
+          }
+          cadenceDeltas = [];
+        };
+        for (const row of cadenceRows) {
+          if (row.work_id !== cadenceWork) {
+            flushCadence();
+            cadenceWork = row.work_id;
+            cadencePrevious = null;
+          }
+          const at = new Date(row.created_at).getTime();
+          if (cadencePrevious !== null) {
+            cadenceDeltas.push(at - cadencePrevious);
+          }
+          cadencePrevious = at;
+        }
+        flushCadence();
+
+        // Rework: repeated checkpoints for the same stage on the same work.
+        const rework = (
+          db
+            .prepare(
+              "SELECT work_id, completed_stage AS stage, COUNT(*) AS count FROM checkpoints " +
+                "GROUP BY work_id, completed_stage HAVING COUNT(*) > 1 " +
+                "ORDER BY work_id ASC, completed_stage ASC",
+            )
+            .all() as Array<{ work_id: string; stage: string; count: number }>
+        ).map((row) => ({ workId: row.work_id, stage: row.stage, count: row.count }));
+
+        // Task usage: task-row counts per work item.
+        const taskUsage = (
+          db
+            .prepare(
+              "SELECT work_id, COUNT(*) AS task_rows FROM harness_tasks " +
+                "GROUP BY work_id ORDER BY work_id ASC",
+            )
+            .all() as Array<{ work_id: string; task_rows: number }>
+        ).map((row) => ({ workId: row.work_id, taskRows: row.task_rows }));
+
+        return {
+          coverage: { withCheckpoint, total: coverageTotal },
+          order: { compliant: orderCompliant, total: orderTotal, bypasses: orderBypasses },
+          hygiene: { live, ended, oldestLiveAgeMs },
+          cadenceMs,
+          rework,
+          taskUsage,
+          advisoryCaveat: METRICS_ADVISORY_CAVEAT,
         };
       } catch (error) {
         throw asStoreUnavailable(error);
@@ -812,6 +1344,18 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           body: input.body,
           createdAt: now(),
         };
+        // Slice A: persist the versioned envelope header inline; the record
+        // keeps the free body while the stored bytes carry header + body.
+        const storedBody = emitEnvelope(
+          {
+            stage: record.stage,
+            sessionId: record.sessionId,
+            workId: record.workId,
+            artifactId: record.id,
+            createdAt: record.createdAt,
+          },
+          input.body,
+        );
         requireOpen()
           .prepare(
             "INSERT INTO stage_artifacts(id, session_id, work_id, workspace, change_id, stage, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -823,7 +1367,7 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
             record.workspace,
             record.changeId,
             record.stage,
-            record.body,
+            storedBody,
             record.createdAt,
           );
         return record;
@@ -874,7 +1418,9 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           workspace: row.workspace,
           changeId: row.change_id,
           stage: row.stage,
-          body: row.body,
+          // Slice A: strip the envelope header on read; pre-change rows
+          // without a header read as full text. Columns stay authoritative.
+          body: parseEnvelope(row.body).body,
           createdAt: row.created_at,
         };
       } catch (error) {
@@ -1129,10 +1675,16 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
         const db = requireOpen();
         const cutoff = new Date(nowIso).getTime() - SESSION_RETENTION_DAYS * 86400000;
         const ended = db
-          .prepare("SELECT id, ended_at FROM sessions WHERE ended_at IS NOT NULL")
-          .all() as Array<{ id: string; ended_at: string }>;
+          .prepare("SELECT id, ended_at, status FROM sessions WHERE ended_at IS NOT NULL")
+          .all() as Array<{ id: string; ended_at: string; status: string | null }>;
         const purged: string[] = [];
         for (const row of ended) {
+          // Slice E lifecycle v2: reopened sessions keep `ended_at` as audit
+          // but are live again — the "live never purged" contract skips them
+          // while the ended_at 90-day rule itself is unchanged.
+          if (row.status === "live") {
+            continue;
+          }
           if (new Date(row.ended_at).getTime() < cutoff) {
             purged.push(row.id);
           }

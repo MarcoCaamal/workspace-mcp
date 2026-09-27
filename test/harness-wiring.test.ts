@@ -6,8 +6,13 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createServer } from "../src/server.js";
-import { openHarnessStore, type HarnessStore } from "../src/session-store.js";
+import { createServer, METRICS_BOUNDARY_SENTENCE } from "../src/server.js";
+import {
+  HARNESS_STAGE_CONTRACTS,
+  HARNESS_STAGES,
+  openHarnessStore,
+  type HarnessStore,
+} from "../src/session-store.js";
 import { DEFAULT_SHELL_ALLOW, type ShellConfig } from "../src/shell.js";
 import type { WorkspaceConfig } from "../src/workspaces.js";
 import { WorkspaceRegistry } from "../src/workspaces.js";
@@ -35,7 +40,7 @@ async function connect(options: {
   workspaces: WorkspaceConfig[];
   defaultWorkspace?: string;
   shell?: ShellConfig;
-  harness?: { session?: boolean; store?: HarnessStore };
+  harness?: { session?: boolean; recall?: boolean; store?: HarnessStore };
 }): Promise<Session> {
   const server = createServer({
     workspaces: options.workspaces,
@@ -106,7 +111,7 @@ describe("slice 2 wiring: harness tool registration", () => {
     }
   });
 
-  it("registers the eight harness tools when the harness flag is on", async () => {
+  it("registers the nine harness tools when the harness flag is on", async () => {
     const root = path.join(base, "flag-on");
     const { mkdir } = await import("node:fs/promises");
     await mkdir(root, { recursive: true });
@@ -121,6 +126,7 @@ describe("slice 2 wiring: harness tool registration", () => {
       for (const expected of [
         "session_start",
         "session_end",
+        "session_reopen",
         "work_start",
         "session_resume",
         "stage_write",
@@ -130,7 +136,7 @@ describe("slice 2 wiring: harness tool registration", () => {
       ]) {
         expect(names, `expected harness tool ${expected}`).toContain(expected);
       }
-      expect(names).toHaveLength(27);
+      expect(names).toHaveLength(28);
     } finally {
       await close(session);
     }
@@ -262,6 +268,150 @@ describe("slice 2 operator docs", () => {
   });
 });
 
+describe("slice B metrics zero-leak wiring: never an MCP tool", () => {
+  async function connectWithStore(
+    dirName: string,
+    extra?: { recall?: boolean; shell?: ShellConfig },
+  ): Promise<Session> {
+    const { mkdir } = await import("node:fs/promises");
+    const root = path.join(base, dirName);
+    await mkdir(root, { recursive: true });
+    const store = openHarnessStore({ dbPath: path.join(base, `${dirName}.db`), workspaceRoots: [root] });
+    store.open();
+    return connect({
+      workspaces: [{ name: "default", path: root }],
+      shell: extra?.shell,
+      harness: { session: true, recall: extra?.recall, store },
+    });
+  }
+
+  async function toolNamesAndDescriptions(session: Session): Promise<{ names: string[]; descriptions: string[] }> {
+    const listed = await session.client.listTools();
+    return {
+      names: listed.tools.map((tool) => tool.name),
+      descriptions: listed.tools.map((tool) => tool.description ?? ""),
+    };
+  }
+
+  it("exposes no metrics surface when the harness flag is off", async () => {
+    const root = path.join(base, "metrics-off");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(root, { recursive: true });
+    const session = await connect({ workspaces: [{ name: "default", path: root }] });
+    try {
+      const { names, descriptions } = await toolNamesAndDescriptions(session);
+      expect(names).toHaveLength(19);
+      for (const name of names) {
+        expect(name, `tool name ${name} must not expose metrics`).not.toMatch(/metric/i);
+      }
+      for (const description of descriptions) {
+        expect(description, "tool description must not expose metrics").not.toMatch(/metric/i);
+      }
+    } finally {
+      await close(session);
+    }
+  });
+
+  it("exposes no metrics tool under any harness/shell flag combination", async () => {
+    const combos: Array<{ dir: string; extra?: { recall?: boolean; shell?: ShellConfig } }> = [
+      { dir: "metrics-session" },
+      { dir: "metrics-recall", extra: { recall: true } },
+      {
+        dir: "metrics-shell",
+        extra: { shell: { enabled: true, mode: "allowlist", allow: [...DEFAULT_SHELL_ALLOW] } },
+      },
+      {
+        dir: "metrics-all",
+        extra: { recall: true, shell: { enabled: true, mode: "allowlist", allow: [...DEFAULT_SHELL_ALLOW] } },
+      },
+    ];
+    for (const combo of combos) {
+      const session = await connectWithStore(combo.dir, combo.extra);
+      try {
+        const { names, descriptions } = await toolNamesAndDescriptions(session);
+        expect(names, `flag combo ${combo.dir} must not register harness_metrics`).not.toContain("harness_metrics");
+        for (const name of names) {
+          expect(name, `flag combo ${combo.dir}: tool name ${name} must not expose metrics`).not.toMatch(/metric/i);
+        }
+        for (const description of descriptions) {
+          expect(description, `flag combo ${combo.dir}: tool description must not expose metrics`).not.toMatch(
+            /metric/i,
+          );
+        }
+      } finally {
+        await close(session);
+      }
+    }
+  });
+
+  it("publishes exactly one static boundary sentence and no metrics query syntax in instructions", async () => {
+    const root = path.join(base, "boundary-instructions");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(root, { recursive: true });
+    const text = instructionsWithHarness([{ name: "default", path: root }]);
+    expect(text, "harness instructions must carry the metrics boundary sentence").toContain(
+      METRICS_BOUNDARY_SENTENCE,
+    );
+    const withoutBoundary = text.replace(METRICS_BOUNDARY_SENTENCE, "");
+    expect(withoutBoundary, "instructions must not describe a metrics surface").not.toMatch(/metric/i);
+    expect(withoutBoundary, "instructions must not document a metrics query path").not.toContain("--harness-metrics");
+    expect(withoutBoundary, "instructions must not document metrics SQL").not.toMatch(/\bSELECT\b/i);
+    expect(withoutBoundary, "instructions must not name the snapshot method").not.toContain("getMetricsSnapshot");
+  });
+
+  it("keeps every chat-visible renderer free of metric values", async () => {
+    const session = await connectWithStore("metrics-renderers");
+    try {
+      const started = await callTool(session, "session_start", {});
+      expect(started.isError).toBe(false);
+      const sessionToken = started.text.split("\n")[0]!.trim();
+      const workStarted = await callTool(session, "work_start", { session: sessionToken });
+      expect(workStarted.isError).toBe(false);
+      const workToken = workStarted.text.split("\n")[0]!.trim();
+      const staged = await callTool(session, "stage_write", {
+        session: sessionToken,
+        work: workToken,
+        stage: "explore",
+        body: "explore body for leak checks",
+      });
+      expect(staged.isError).toBe(false);
+      const artifactId = staged.text.split("\n")[0]!.trim();
+      const checked = await callTool(session, "checkpoint", {
+        session: sessionToken,
+        work: workToken,
+        completedStage: "explore",
+        artifactId,
+        summary: "explore complete",
+      });
+      expect(checked.isError).toBe(false);
+      const status = await callTool(session, "harness_status", { session: sessionToken, work: workToken });
+      expect(status.isError).toBe(false);
+      const resumed = await callTool(session, "session_resume", { session: sessionToken, work: workToken });
+      expect(resumed.isError).toBe(false);
+      for (const [label, output] of [
+        ["harness_status", status.text],
+        ["session_resume", resumed.text],
+        ["checkpoint", checked.text],
+      ] as const) {
+        expect(output, `${label} must not leak metric values`).not.toMatch(/coverag|order|hygiene|rework|cadence/i);
+        expect(output, `${label} must not carry the advisory caveat`).not.toMatch(/advisor|gameable/i);
+      }
+    } finally {
+      await close(session);
+    }
+  });
+
+  it("keeps the boundary sentence free of tools, values, and query syntax", () => {
+    expect(METRICS_BOUNDARY_SENTENCE, "boundary names categories only").toMatch(/coverage/i);
+    expect(METRICS_BOUNDARY_SENTENCE).toMatch(/cadence/i);
+    expect(METRICS_BOUNDARY_SENTENCE).toMatch(/hygiene/i);
+    expect(METRICS_BOUNDARY_SENTENCE).toMatch(/rework/i);
+    expect(METRICS_BOUNDARY_SENTENCE, "boundary redirects to the operator").toMatch(/Marco/);
+    expect(METRICS_BOUNDARY_SENTENCE, "boundary names no tool").not.toMatch(/tool|harness_metrics|metric\b/i);
+    expect(METRICS_BOUNDARY_SENTENCE, "boundary carries no values").not.toMatch(/\d|%|query|SELECT|--/);
+  });
+});
+
 describe("slice 2 end to end over fresh server instances", () => {
   it("runs start, work, stage_write, task_write, checkpoint, resume with bodies surviving root removal", async () => {
     const { mkdir } = await import("node:fs/promises");
@@ -338,6 +488,146 @@ describe("slice 2 end to end over fresh server instances", () => {
       expect(status.next).toBe("propose");
     } finally {
       survivingStore.close();
+    }
+  });
+});
+
+describe("slice C continuation table: single source, no drift, zero metrics", () => {
+  async function registeredToolNames(dirName: string, recall?: boolean): Promise<string[]> {
+    const { mkdir } = await import("node:fs/promises");
+    const root = path.join(base, dirName);
+    await mkdir(root, { recursive: true });
+    const store = openHarnessStore({
+      dbPath: path.join(base, `${dirName}.db`),
+      workspaceRoots: [root],
+    });
+    store.open();
+    const session = await connect({
+      workspaces: [{ name: "default", path: root }],
+      harness: { session: true, recall, store },
+    });
+    try {
+      return (await session.client.listTools()).tools.map((tool) => tool.name);
+    } finally {
+      await close(session);
+    }
+  }
+
+  it("keys the per-stage table exactly to HARNESS_STAGES", () => {
+    expect(Object.keys(HARNESS_STAGE_CONTRACTS).sort()).toEqual([...HARNESS_STAGES].sort());
+    for (const stage of HARNESS_STAGES) {
+      expect(
+        HARNESS_STAGE_CONTRACTS[stage].allowedActions.length,
+        `stage ${stage} must allow at least one action`,
+      ).toBeGreaterThan(0);
+      expect(
+        HARNESS_STAGE_CONTRACTS[stage].artifact.length,
+        `stage ${stage} must name its artifact`,
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  it("names only real registered tools in every stage contract", async () => {
+    for (const [dir, recall] of [
+      ["contracts-session", undefined],
+      ["contracts-recall", true],
+    ] as const) {
+      const names = await registeredToolNames(dir, recall);
+      for (const stage of HARNESS_STAGES) {
+        for (const action of HARNESS_STAGE_CONTRACTS[stage].allowedActions) {
+          expect(names, `stage ${stage}: ${action} must be a registered tool`).toContain(action);
+        }
+      }
+    }
+  });
+
+  it("keeps enriched continuation payloads free of metric values and surfaces", () => {
+    expect(JSON.stringify(HARNESS_STAGE_CONTRACTS)).not.toMatch(
+      /coverag|cadence|hygiene|rework|gameable|advisor|metric|SELECT|%|harness_metrics|--harness-metrics/i,
+    );
+  });
+});
+
+/**
+ * Slice E lifecycle v2 wiring (change harness-operability, task E.4 RED):
+ * `session_reopen` is registered only under the existing `harness.session`
+ * gate (no new flags), and the instructions carry the ended-state + reopen
+ * boundary sentence.
+ */
+describe("slice E lifecycle v2 wiring: session_reopen registration gate", () => {
+  it("registers session_reopen only under the harness session gate", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const root = path.join(base, "reopen-gate");
+    await mkdir(root, { recursive: true });
+    const store = openHarnessStore({
+      dbPath: path.join(base, "reopen-gate.db"),
+      workspaceRoots: [root],
+    });
+    store.open();
+    const session = await connect({
+      workspaces: [{ name: "default", path: root }],
+      harness: { session: true, store },
+    });
+    try {
+      const names = (await session.client.listTools()).tools.map((tool) => tool.name);
+      expect(names).toContain("session_reopen");
+    } finally {
+      await close(session);
+    }
+
+    const offRoot = path.join(base, "reopen-gate-off");
+    await mkdir(offRoot, { recursive: true });
+    const off = await connect({ workspaces: [{ name: "default", path: offRoot }] });
+    try {
+      const names = (await off.client.listTools()).tools.map((tool) => tool.name);
+      expect(names).toHaveLength(19);
+      expect(names).not.toContain("session_reopen");
+    } finally {
+      await close(off);
+    }
+  });
+
+  it("documents the ended-state plus reopen boundary in instructions", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const root = path.join(base, "reopen-instructions");
+    await mkdir(root, { recursive: true });
+    const text = instructionsWithHarness([{ name: "default", path: root }]);
+    expect(text).toContain("session_reopen");
+    expect(text).toMatch(/ended/i);
+    expect(text).toMatch(/snapshot|read-only/i);
+  });
+});
+
+/**
+ * Slice D bootstrap hints (change harness-operability, task D.4 RED).
+ *
+ * `buildInstructions` surfaces the static bilingual natural-trigger hints
+ * and the per-stage contract surface (derived from the single-source table).
+ * Guidance only: no implicit resolution, no new registration flags.
+ */
+describe("slice D bootstrap hints in instructions", () => {
+  it("publishes the bilingual trigger hints as documented guidance", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const root = path.join(base, "bootstrap-hints");
+    await mkdir(root, { recursive: true });
+    const text = instructionsWithHarness([{ name: "default", path: root }]);
+    expect(text).toContain("nuevo trabajo");
+    expect(text).toContain("work_start");
+    expect(text).toContain("continúa la sesión anterior");
+    expect(text).toContain("session_resume");
+    expect(text).toMatch(/explicit.*token|token.*explicit/i);
+  });
+
+  it("surfaces every stage contract from the single-source table", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const root = path.join(base, "bootstrap-contracts");
+    await mkdir(root, { recursive: true });
+    const text = instructionsWithHarness([{ name: "default", path: root }]);
+    for (const stage of HARNESS_STAGES) {
+      expect(text, `instructions must surface stage ${stage}`).toContain(stage);
+      expect(text, `instructions must surface the ${stage} artifact`).toContain(
+        HARNESS_STAGE_CONTRACTS[stage].artifact,
+      );
     }
   });
 });

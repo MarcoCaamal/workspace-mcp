@@ -7,6 +7,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "../src/server.js";
 import { openHarnessStore, type HarnessStore } from "../src/session-store.js";
+import { renderCheckpointLines, renderContinuationLines } from "../src/tools/recall.js";
 
 /**
  * Slice 3 scoped recall + degraded optionals (change chatgpt-workspace-harness,
@@ -248,6 +249,36 @@ describe("scoped harness recall (store level)", () => {
     const { sessionA } = seedTwoSessions();
     const rows = active().searchStageArtifacts("zebra", { sessionId: sessionA, limit: 500 });
     expect(rows.length).toBeLessThanOrEqual(50);
+  });
+
+  it("keeps header-carrying bodies recallable via bm25 and returns the free body", () => {
+    const session = active().startSession(rootA);
+    const work = active().startWork(session.id, rootA, "change-1");
+    const body = "envelope recall body about apricot turbine latticework";
+    const artifact = active().writeStageArtifact({
+      sessionId: session.id,
+      workId: work.id,
+      workspace: rootA,
+      changeId: "change-1",
+      stage: "design",
+      body,
+    });
+    const rows = active().searchStageArtifacts("apricot turbine", {
+      sessionId: session.id,
+      limit: 20,
+    });
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.id).toBe(artifact.id);
+    expect(rows[0]?.body).toBe(body);
+  });
+
+  it("does not let header tokens break scoped recall isolation", () => {
+    const { sessionA, sessionB } = seedTwoSessions();
+    const rowsA = active().searchStageArtifacts("zebra", { sessionId: sessionA, limit: 20 });
+    expect(rowsA.length).toBeGreaterThan(0);
+    expect(rowsA.every((row) => row.sessionId === sessionA)).toBe(true);
+    const rowsB = active().searchStageArtifacts("zebra", { sessionId: sessionB, limit: 20 });
+    expect(rowsB.length).toBe(0);
   });
 });
 
@@ -572,5 +603,90 @@ describe("slice 3 end to end (task 4.6)", () => {
     } finally {
       await close(second);
     }
+  });
+});
+
+/**
+ * Slice C continuation lines (change harness-operability, task C.4).
+ *
+ * Shared render helpers for the derived continuation: `harness_status` and
+ * `session_resume` print identical `currentStage`/`next`/`reason` and
+ * latest-checkpoint lines from the single store derivation. Covered here
+ * (not in the status suite) because the lines render continuation for
+ * header-carrying bodies: the seed writes go through the Slice A envelope
+ * path, and the rendered lines must still match the store derivation.
+ */
+describe("slice C continuation lines for header-carrying bodies", () => {
+  let sandbox: string;
+  let rootA: string;
+  let dbPath: string;
+  let store: HarnessStore | null = null;
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(path.join(tmpdir(), "workspace-mcp-continuation-lines-"));
+    rootA = path.join(sandbox, "root-a");
+    await mkdir(rootA, { recursive: true });
+    dbPath = path.join(sandbox, "harness.db");
+    store = openHarnessStore({ dbPath, workspaceRoots: [rootA] });
+    store.open();
+  });
+
+  afterEach(async () => {
+    store?.close();
+    store = null;
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  function active(): HarnessStore {
+    if (store === null) {
+      throw new Error("store not open");
+    }
+    return store;
+  }
+
+  it("renders the derived continuation lines for a header-carrying checkpoint", () => {
+    const session = active().startSession(rootA);
+    const work = active().startWork(session.id, rootA, "change-1");
+    const artifact = active().writeStageArtifact({
+      sessionId: session.id,
+      workId: work.id,
+      workspace: rootA,
+      changeId: "change-1",
+      stage: "design",
+      body: "header-carrying design body for continuation lines",
+    });
+    const checkpoint = active().checkpoint({
+      sessionId: session.id,
+      workId: work.id,
+      workspace: rootA,
+      changeId: "change-1",
+      completedStage: "design",
+      artifactId: artifact.id,
+      summary: "design checkpoint summary",
+    });
+    const status = active().harnessStatus(session.id, work.id);
+    expect(renderContinuationLines(status)).toEqual([
+      "currentStage: design",
+      "next: tasks",
+      `reason: ${status.reason}`,
+    ]);
+    expect(renderCheckpointLines(status.latestCheckpoint)).toEqual([
+      `latestCheckpoint: seq ${checkpoint.seq} stage design`,
+      "summary: design checkpoint summary",
+    ]);
+  });
+
+  it("renders the empty-state continuation lines with no checkpoint", () => {
+    const session = active().startSession(rootA);
+    const work = active().startWork(session.id, rootA, "change-1");
+    const status = active().harnessStatus(session.id, work.id);
+    expect(renderContinuationLines(status)).toEqual([
+      "currentStage: (none)",
+      "next: explore",
+      `reason: ${status.reason}`,
+    ]);
+    expect(renderCheckpointLines(status.latestCheckpoint)).toEqual([
+      "latestCheckpoint: (none)",
+    ]);
   });
 });
