@@ -7,6 +7,9 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "../src/server.js";
 import {
+  CONTINUATION_ENVELOPE_VERSION,
+  HARNESS_STAGE_CONTRACTS,
+  HARNESS_STAGES,
   HarnessStoreError,
   openHarnessStore,
   type HarnessStore,
@@ -564,6 +567,294 @@ describe("harness restart durability", () => {
       await client.close().catch(() => undefined);
       await server.close().catch(() => undefined);
       store.close();
+    }
+  });
+});
+
+/**
+ * Slice C continuation (change harness-operability, task C.1 RED).
+ *
+ * Opt-in JSON envelope on the single store derivation: default `text` output
+ * stays byte-identical to pre-change behavior (golden approval tests below),
+ * while explicit `format: "json"` returns a versioned envelope whose
+ * `next`/`reason` equal the text derivation for the same state, with a
+ * per-stage table and a capped latest checkpoint (explicit truncation marker,
+ * JSON stays parseable). Enriched payloads carry NO metric values.
+ */
+describe("slice C continuation: opt-in JSON envelope on the single derivation", () => {
+  let sandbox: string;
+  let rootA: string;
+  let dbPath: string;
+
+  interface HarnessClient {
+    client: Client;
+    server: McpServer;
+  }
+
+  interface ToolResponse {
+    text: string;
+    isError: boolean;
+  }
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(path.join(tmpdir(), "workspace-mcp-continuation-"));
+    rootA = path.join(sandbox, "root-a");
+    await mkdir(rootA, { recursive: true });
+    dbPath = path.join(sandbox, "harness.db");
+  });
+
+  afterEach(async () => {
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  async function connectWithHarness(): Promise<HarnessClient> {
+    const store = openHarnessStore({ dbPath, workspaceRoots: [rootA] });
+    store.open();
+    const server = (createServer as (...args: unknown[]) => McpServer)({
+      workspaces: [{ name: "alpha", path: rootA }],
+      defaultWorkspace: "alpha",
+      version: "test",
+      harness: { session: true, store },
+    } as unknown);
+    const client = new Client({ name: "workspace-mcp-continuation-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    (server as unknown as { __harnessStore?: HarnessStore }).__harnessStore = store;
+    return { client, server };
+  }
+
+  async function closeHarness(session: HarnessClient): Promise<void> {
+    await session.client.close().catch(() => undefined);
+    await session.server.close().catch(() => undefined);
+    (session.server as unknown as { __harnessStore?: HarnessStore }).__harnessStore?.close();
+  }
+
+  async function callTool(
+    session: HarnessClient,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<ToolResponse> {
+    const result = await session.client.callTool({ name, arguments: args });
+    const content = (result.content ?? []) as Array<{ type: string; text?: string }>;
+    const text = content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text ?? "")
+      .join("\n");
+    return { text, isError: result.isError === true };
+  }
+
+  function firstLine(text: string): string {
+    return (text.split("\n")[0] ?? "").trim();
+  }
+
+  async function startSeededWork(session: HarnessClient, summary: string): Promise<{
+    sessionToken: string;
+    workToken: string;
+    artifactId: string;
+  }> {
+    const started = await callTool(session, "session_start", { workspace: "alpha" });
+    expect(started.isError).toBe(false);
+    const sessionToken = firstLine(started.text);
+    const workStarted = await callTool(session, "work_start", {
+      session: sessionToken,
+      workspace: "alpha",
+      changeId: "change-1",
+    });
+    expect(workStarted.isError).toBe(false);
+    const workToken = firstLine(workStarted.text);
+    const staged = await callTool(session, "stage_write", {
+      session: sessionToken,
+      work: workToken,
+      workspace: "alpha",
+      stage: "spec",
+      body: "spec body for continuation",
+    });
+    expect(staged.isError).toBe(false);
+    const artifactId = firstLine(staged.text);
+    const checked = await callTool(session, "checkpoint", {
+      session: sessionToken,
+      work: workToken,
+      workspace: "alpha",
+      completedStage: "spec",
+      artifactId,
+      summary,
+    });
+    expect(checked.isError).toBe(false);
+    return { sessionToken, workToken, artifactId };
+  }
+
+  function textLines(text: string, key: string): string {
+    const line = text.split("\n").find((entry) => entry.startsWith(`${key}:`));
+    expect(line, `expected a ${key} line in text output`).toBeDefined();
+    return (line ?? "").slice(key.length + 1).trim();
+  }
+
+  it("keeps harness_status default text byte-identical when format is omitted", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededWork(session, "spec checkpoint summary");
+      const status = await callTool(session, "harness_status", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(status.isError).toBe(false);
+      expect(status.text).toBe(
+        [
+          `session: ${sessionToken}`,
+          "currentStage: spec",
+          "next: design",
+          "reason: spec checkpointed; continue with design",
+          "unverified: false",
+          "latestCheckpoint: seq 1 stage spec",
+          "summary: spec checkpoint summary",
+        ].join("\n"),
+      );
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("keeps session_resume default text byte-identical when format is omitted", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededWork(session, "spec checkpoint summary");
+      const resumed = await callTool(session, "session_resume", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(resumed.isError).toBe(false);
+      expect(resumed.text).toBe(
+        [
+          `session: ${sessionToken}`,
+          `primaryWorkspace: ${rootA}`,
+          `work: ${workToken}`,
+          `workWorkspace: ${rootA}`,
+          "changeId: change-1",
+          "latestCheckpoint: seq 1 stage spec",
+          "summary: spec checkpoint summary",
+          "next: design",
+        ].join("\n"),
+      );
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("returns a versioned JSON envelope consistent with the text derivation", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken, artifactId } = await startSeededWork(
+        session,
+        "spec checkpoint summary",
+      );
+      const text = await callTool(session, "harness_status", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(text.isError).toBe(false);
+      const json = await callTool(session, "harness_status", {
+        session: sessionToken,
+        work: workToken,
+        format: "json",
+      });
+      expect(json.isError).toBe(false);
+      const envelope = JSON.parse(json.text) as {
+        version: number;
+        next: string;
+        reason: string;
+        perStage: Array<{ stage: string; allowedActions: string[]; artifact: string }>;
+        latestCheckpoint: {
+          seq: number;
+          completedStage: string;
+          artifactId: string;
+          summary: string;
+          truncated: boolean;
+        } | null;
+      };
+      expect(envelope.version).toBe(CONTINUATION_ENVELOPE_VERSION);
+      expect(envelope.version).toBe(1);
+      expect(envelope.next).toBe(textLines(text.text, "next"));
+      expect(envelope.reason).toBe(textLines(text.text, "reason"));
+      expect(envelope.perStage.map((entry) => entry.stage)).toEqual([...HARNESS_STAGES]);
+      for (const entry of envelope.perStage) {
+        expect(entry.allowedActions.length).toBeGreaterThan(0);
+        expect(entry.artifact.length).toBeGreaterThan(0);
+      }
+      expect(envelope.latestCheckpoint?.seq).toBe(1);
+      expect(envelope.latestCheckpoint?.completedStage).toBe("spec");
+      expect(envelope.latestCheckpoint?.artifactId).toBe(artifactId);
+      expect(envelope.latestCheckpoint?.summary).toBe("spec checkpoint summary");
+      expect(envelope.latestCheckpoint?.truncated).toBe(false);
+      expect(HARNESS_STAGE_CONTRACTS.spec.artifact.length).toBeGreaterThan(0);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("truncates an oversized checkpoint with an explicit marker and stays parseable", async () => {
+    const session = await connectWithHarness();
+    try {
+      const oversize = `long summary body ${"x".repeat(2500)}`;
+      const { sessionToken, workToken } = await startSeededWork(session, oversize);
+      const json = await callTool(session, "harness_status", {
+        session: sessionToken,
+        work: workToken,
+        format: "json",
+      });
+      expect(json.isError).toBe(false);
+      const envelope = JSON.parse(json.text) as {
+        latestCheckpoint: { summary: string; truncated: boolean } | null;
+      };
+      expect(envelope.latestCheckpoint?.truncated).toBe(true);
+      expect(envelope.latestCheckpoint?.summary).toMatch(/\[truncated \d+ chars\]/);
+      expect(envelope.latestCheckpoint?.summary.length).toBeLessThan(oversize.length);
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("returns session_resume JSON with next/reason equal to the text derivation", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededWork(session, "spec checkpoint summary");
+      const text = await callTool(session, "session_resume", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(text.isError).toBe(false);
+      const json = await callTool(session, "session_resume", {
+        session: sessionToken,
+        work: workToken,
+        format: "json",
+      });
+      expect(json.isError).toBe(false);
+      const envelope = JSON.parse(json.text) as { version: number; next: string; reason: string };
+      expect(envelope.version).toBe(1);
+      expect(envelope.next).toBe(textLines(text.text, "next"));
+      expect(envelope.reason).toContain("spec checkpointed; continue with design");
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("carries zero metric values in enriched continuation payloads", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededWork(session, "spec checkpoint summary");
+      for (const tool of ["harness_status", "session_resume"] as const) {
+        const json = await callTool(session, tool, {
+          session: sessionToken,
+          work: workToken,
+          format: "json",
+        });
+        expect(json.isError).toBe(false);
+        expect(() => JSON.parse(json.text), `${tool} output must be JSON`).not.toThrow();
+        expect(json.text, `${tool} JSON must carry no metric values`).not.toMatch(
+          /coverag|cadence|hygiene|rework|gameable|advisor|deltasMs|taskRows|oldestLiveAgeMs|withCheckpoint|percent/i,
+        );
+      }
+    } finally {
+      await closeHarness(session);
     }
   });
 });

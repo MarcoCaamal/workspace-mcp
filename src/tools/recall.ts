@@ -119,8 +119,39 @@ export function filterEnrichedLines(
   );
 }
 
-export function renderHarnessRecall(input: {
-  stages: readonly StageArtifactRecord[];
+/**
+ * Slice C continuation lines (change harness-operability): shared rendering
+ * of the derived continuation so the `harness_status` and `session_resume`
+ * text paths print identical lines from the single store derivation.
+ */
+export function renderContinuationLines(status: {
+  currentStage: string | null;
+  next: string;
+  reason: string;
+}): string[] {
+  return [
+    `currentStage: ${status.currentStage ?? "(none)"}`,
+    `next: ${status.next}`,
+    `reason: ${status.reason}`,
+  ];
+}
+
+/** Shared rendering of the latest-checkpoint text lines (Slice C). */
+export function renderCheckpointLines(checkpoint: {
+  seq: number;
+  completedStage: string;
+  summary: string;
+} | null): string[] {
+  if (checkpoint === null) {
+    return ["latestCheckpoint: (none)"];
+  }
+  return [
+    `latestCheckpoint: seq ${checkpoint.seq} stage ${checkpoint.completedStage}`,
+    `summary: ${checkpoint.summary}`,
+  ];
+}
+
+export function renderHarnessRecall(input: {  stages: readonly StageArtifactRecord[];
   checkpoints: readonly CheckpointRecord[];
   enriched: readonly RecallEnrichedLine[];
   degraded: readonly RecallEnrichmentSource[];

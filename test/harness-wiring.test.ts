@@ -7,7 +7,12 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createServer, METRICS_BOUNDARY_SENTENCE } from "../src/server.js";
-import { openHarnessStore, type HarnessStore } from "../src/session-store.js";
+import {
+  HARNESS_STAGE_CONTRACTS,
+  HARNESS_STAGES,
+  openHarnessStore,
+  type HarnessStore,
+} from "../src/session-store.js";
 import { DEFAULT_SHELL_ALLOW, type ShellConfig } from "../src/shell.js";
 import type { WorkspaceConfig } from "../src/workspaces.js";
 import { WorkspaceRegistry } from "../src/workspaces.js";
@@ -483,5 +488,61 @@ describe("slice 2 end to end over fresh server instances", () => {
     } finally {
       survivingStore.close();
     }
+  });
+});
+
+describe("slice C continuation table: single source, no drift, zero metrics", () => {
+  async function registeredToolNames(dirName: string, recall?: boolean): Promise<string[]> {
+    const { mkdir } = await import("node:fs/promises");
+    const root = path.join(base, dirName);
+    await mkdir(root, { recursive: true });
+    const store = openHarnessStore({
+      dbPath: path.join(base, `${dirName}.db`),
+      workspaceRoots: [root],
+    });
+    store.open();
+    const session = await connect({
+      workspaces: [{ name: "default", path: root }],
+      harness: { session: true, recall, store },
+    });
+    try {
+      return (await session.client.listTools()).tools.map((tool) => tool.name);
+    } finally {
+      await close(session);
+    }
+  }
+
+  it("keys the per-stage table exactly to HARNESS_STAGES", () => {
+    expect(Object.keys(HARNESS_STAGE_CONTRACTS).sort()).toEqual([...HARNESS_STAGES].sort());
+    for (const stage of HARNESS_STAGES) {
+      expect(
+        HARNESS_STAGE_CONTRACTS[stage].allowedActions.length,
+        `stage ${stage} must allow at least one action`,
+      ).toBeGreaterThan(0);
+      expect(
+        HARNESS_STAGE_CONTRACTS[stage].artifact.length,
+        `stage ${stage} must name its artifact`,
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  it("names only real registered tools in every stage contract", async () => {
+    for (const [dir, recall] of [
+      ["contracts-session", undefined],
+      ["contracts-recall", true],
+    ] as const) {
+      const names = await registeredToolNames(dir, recall);
+      for (const stage of HARNESS_STAGES) {
+        for (const action of HARNESS_STAGE_CONTRACTS[stage].allowedActions) {
+          expect(names, `stage ${stage}: ${action} must be a registered tool`).toContain(action);
+        }
+      }
+    }
+  });
+
+  it("keeps enriched continuation payloads free of metric values and surfaces", () => {
+    expect(JSON.stringify(HARNESS_STAGE_CONTRACTS)).not.toMatch(
+      /coverag|cadence|hygiene|rework|gameable|advisor|metric|SELECT|%|harness_metrics|--harness-metrics/i,
+    );
   });
 });
