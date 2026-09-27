@@ -1226,20 +1226,20 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
         // snapshots of an unchanged store stay byte-identical (determinism
         // scenario, including CLI double-runs seconds apart).
         const hygieneRows = db
-          .prepare("SELECT ended_at, created_at FROM sessions")
-          .all() as Array<{ ended_at: string | null; created_at: string }>;
+          .prepare("SELECT status, created_at FROM sessions")
+          .all() as Array<{ status: string; created_at: string }>;
         let live = 0;
         let ended = 0;
         let oldestLiveCreated: number | null = null;
         for (const row of hygieneRows) {
-          if (row.ended_at !== null) {
-            ended += 1;
-          } else {
+          if (row.status === "live") {
             live += 1;
             const created = new Date(row.created_at).getTime();
             if (oldestLiveCreated === null || created < oldestLiveCreated) {
               oldestLiveCreated = created;
             }
+          } else {
+            ended += 1;
           }
         }
         const latestEvent = (
