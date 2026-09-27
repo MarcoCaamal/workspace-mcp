@@ -868,3 +868,166 @@ describe("slice C continuation: opt-in JSON envelope on the single derivation", 
     }
   });
 });
+
+/**
+ * Slice E lifecycle v2 (change harness-operability, task E.4 RED): ended
+ * snapshots on `harness_status`. Text snapshots carry the read-time state,
+ * the latest checkpoint, the derived next action, and reopen guidance with
+ * zero metric values; the JSON shape stays parseable and carries the state.
+ */
+describe("slice E lifecycle v2: ended snapshots on harness_status", () => {
+  let sandbox: string;
+  let rootA: string;
+  let dbPath: string;
+
+  interface HarnessClient {
+    client: Client;
+    server: McpServer;
+  }
+
+  interface ToolResponse {
+    text: string;
+    isError: boolean;
+  }
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(path.join(tmpdir(), "workspace-mcp-ended-status-"));
+    rootA = path.join(sandbox, "root-a");
+    await mkdir(rootA, { recursive: true });
+    dbPath = path.join(sandbox, "harness.db");
+  });
+
+  afterEach(async () => {
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  async function connectWithHarness(): Promise<HarnessClient> {
+    const store = openHarnessStore({ dbPath, workspaceRoots: [rootA] });
+    store.open();
+    const server = (createServer as (...args: unknown[]) => McpServer)({
+      workspaces: [{ name: "alpha", path: rootA }],
+      defaultWorkspace: "alpha",
+      version: "test",
+      harness: { session: true, store },
+    } as unknown);
+    const client = new Client({ name: "workspace-mcp-ended-status-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    (server as unknown as { __harnessStore?: HarnessStore }).__harnessStore = store;
+    return { client, server };
+  }
+
+  async function closeHarness(session: HarnessClient): Promise<void> {
+    await session.client.close().catch(() => undefined);
+    await session.server.close().catch(() => undefined);
+    (session.server as unknown as { __harnessStore?: HarnessStore }).__harnessStore?.close();
+  }
+
+  async function callTool(
+    session: HarnessClient,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<ToolResponse> {
+    const result = await session.client.callTool({ name, arguments: args });
+    const content = (result.content ?? []) as Array<{ type: string; text?: string }>;
+    const text = content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text ?? "")
+      .join("\n");
+    return { text, isError: result.isError === true };
+  }
+
+  function firstLine(text: string): string {
+    return (text.split("\n")[0] ?? "").trim();
+  }
+
+  async function startSeededWork(session: HarnessClient, summary: string): Promise<{
+    sessionToken: string;
+    workToken: string;
+  }> {
+    const started = await callTool(session, "session_start", { workspace: "alpha" });
+    expect(started.isError).toBe(false);
+    const sessionToken = firstLine(started.text);
+    const workStarted = await callTool(session, "work_start", {
+      session: sessionToken,
+      workspace: "alpha",
+      changeId: "change-1",
+    });
+    expect(workStarted.isError).toBe(false);
+    const workToken = firstLine(workStarted.text);
+    const staged = await callTool(session, "stage_write", {
+      session: sessionToken,
+      work: workToken,
+      workspace: "alpha",
+      stage: "spec",
+      body: "spec body for ended snapshots",
+    });
+    expect(staged.isError).toBe(false);
+    const checked = await callTool(session, "checkpoint", {
+      session: sessionToken,
+      work: workToken,
+      workspace: "alpha",
+      completedStage: "spec",
+      artifactId: firstLine(staged.text),
+      summary,
+    });
+    expect(checked.isError).toBe(false);
+    const ended = await callTool(session, "session_end", { session: sessionToken });
+    expect(ended.isError).toBe(false);
+    return { sessionToken, workToken };
+  }
+
+  it("serves an ended status snapshot with state, checkpoint, next, and reopen guidance", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededWork(session, "spec checkpoint summary");
+      const status = await callTool(session, "harness_status", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(status.isError).toBe(false);
+      expect(status.text).toContain("state: idle");
+      expect(status.text).toContain("spec checkpoint summary");
+      expect(status.text).toContain("next: design");
+      expect(status.text).toMatch(/session_reopen/);
+      expect(status.text, "ended snapshot must carry no metric values").not.toMatch(
+        /coverag|cadence|hygiene|rework|gameable|advisor|deltasMs|taskRows|oldestLiveAgeMs|withCheckpoint|percent/i,
+      );
+    } finally {
+      await closeHarness(session);
+    }
+  });
+
+  it("serves an ended status snapshot as parseable JSON carrying the state", async () => {
+    const session = await connectWithHarness();
+    try {
+      const { sessionToken, workToken } = await startSeededWork(session, "spec checkpoint summary");
+      const text = await callTool(session, "harness_status", {
+        session: sessionToken,
+        work: workToken,
+      });
+      expect(text.isError).toBe(false);
+      const json = await callTool(session, "harness_status", {
+        session: sessionToken,
+        work: workToken,
+        format: "json",
+      });
+      expect(json.isError).toBe(false);
+      const envelope = JSON.parse(json.text) as {
+        state: string;
+        next: string;
+        version: number;
+        reopen: string;
+      };
+      expect(envelope.state).toBe("idle");
+      expect(envelope.version).toBe(1);
+      expect(envelope.next).toContain("design");
+      expect(envelope.reopen).toMatch(/session_reopen/);
+      expect(json.text, "ended JSON must carry no metric values").not.toMatch(
+        /coverag|cadence|hygiene|rework|gameable|advisor|deltasMs|taskRows|oldestLiveAgeMs|withCheckpoint|percent/i,
+      );
+    } finally {
+      await closeHarness(session);
+    }
+  });
+});

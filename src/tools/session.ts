@@ -1,8 +1,9 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { HARNESS_STAGES, HarnessStoreError, buildContinuationEnvelope, type HarnessStore } from "../session-store.js";
+import { HARNESS_STAGES, HarnessStoreError, buildContinuationEnvelope, deriveSessionState, type HarnessStore } from "../session-store.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
 import {
+  ENDED_SESSION_REOPEN_GUIDANCE,
   filterEnrichedLines,
   renderBootstrapBlock,
   renderCheckpointLines,
@@ -93,7 +94,7 @@ function harnessErrorText(error: unknown): string {
 }
 
 /**
- * Registers the eight harness session tools. The caller gates this on the
+ * Registers the nine harness session tools. The caller gates this on the
  * `harness.session` flag; flag-off restores pre-harness behavior (the 19
  * legacy tools only). The store is shared across stateless turns so explicit
  * tokens resume across fresh server instances.
@@ -150,8 +151,8 @@ export function registerSessionTools(
     {
       title: "End harness session",
       description:
-        "Close a harness session explicitly. Later use of the token reports closed and never revives it. " +
-        "Session-scoped reads after close report closed; no repo-local files are touched.",
+        "Close a harness session explicitly. Writes with the token are rejected as ended while status and resume serve read-only snapshots; only session_reopen revives it. " +
+        "No repo-local files are touched.",
       inputSchema: {
         session: sessionTokenSchema,
       },
@@ -161,6 +162,29 @@ export function registerSessionTools(
       try {
         store.endSession(session);
         return textResult(`closed session ${session}`);
+      } catch (error) {
+        return errorResult(harnessErrorText(error));
+      }
+    },
+  );
+
+  server.registerTool(
+    "session_reopen",
+    {
+      title: "Reopen harness session",
+      description:
+        "Reopen an ended harness session by explicit token — the only path that revives one. " +
+        "Returns an explicit ended-then-reopened notice and records the reopening so the session stays distinguishable from never-closed ones. " +
+        "Resume without reopening never revives; a tokenless call is rejected and attaches to nothing.",
+      inputSchema: {
+        session: sessionTokenSchema,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ session }) => {
+      try {
+        const { notice } = store.reopenSession(session);
+        return textResult(notice);
       } catch (error) {
         return errorResult(harnessErrorText(error));
       }
@@ -211,7 +235,8 @@ export function registerSessionTools(
       title: "Resume harness session",
       description:
         "Resume a session (and optionally one work item) by explicit token across stateless turns. " +
-        "Unknown or closed tokens are reported, never revived; a tokenless call is rejected and attaches to nothing. " +
+        "Unknown tokens are reported; ended sessions return a read-only snapshot with reopen guidance and are never revived implicitly — use session_reopen. " +
+        "A tokenless call is rejected and attaches to nothing. " +
         "Returns the work context plus the latest checkpoint summary and derived next action from the external store.",
       inputSchema: {
         session: sessionTokenSchema,
@@ -226,6 +251,31 @@ export function registerSessionTools(
         // Single derivation: the store owns next/reason for both text and
         // json, so resume can never diverge from status for the same state.
         const status = store.harnessStatus(session, work);
+        // Slice E lifecycle v2: ended sessions serve a read-only snapshot —
+        // state, latest checkpoint, derived next, reopen guidance — and the
+        // session stays ended (no live-context bootstrap block, no revive).
+        const state = deriveSessionState(resumed.session);
+        if (state !== "live") {
+          if (format === "json") {
+            return textResult(
+              JSON.stringify(
+                { state, ...buildContinuationEnvelope(status), reopen: ENDED_SESSION_REOPEN_GUIDANCE },
+                null,
+                2,
+              ),
+            );
+          }
+          const lines = [
+            `session: ${resumed.session.id}`,
+            `primaryWorkspace: ${resumed.session.primaryWorkspace}`,
+            `work: ${resumed.work?.id ?? "(none)"}`,
+            `state: ${state}`,
+            ...renderCheckpointLines(resumed.latestCheckpoint),
+            `next: ${status.next}`,
+            `reopen: ${ENDED_SESSION_REOPEN_GUIDANCE}`,
+          ];
+          return textResult(lines.join("\n"));
+        }
         if (format === "json") {
           return textResult(JSON.stringify(buildContinuationEnvelope(status), null, 2));
         }
@@ -399,6 +449,28 @@ export function registerSessionTools(
     async ({ session, work, format }) => {
       try {
         const status = store.harnessStatus(session, work);
+        // Slice E lifecycle v2: ended sessions serve a read-only snapshot
+        // instead of throwing — state, derived lines, latest checkpoint,
+        // reopen guidance. Nothing here marks the session live.
+        if (status.state !== "live") {
+          if (format === "json") {
+            return textResult(
+              JSON.stringify(
+                { state: status.state, ...buildContinuationEnvelope(status), reopen: ENDED_SESSION_REOPEN_GUIDANCE },
+                null,
+                2,
+              ),
+            );
+          }
+          const lines = [
+            `session: ${session}`,
+            `state: ${status.state}`,
+            ...renderContinuationLines(status),
+            ...renderCheckpointLines(status.latestCheckpoint),
+            `reopen: ${ENDED_SESSION_REOPEN_GUIDANCE}`,
+          ];
+          return textResult(lines.join("\n"));
+        }
         if (format === "json") {
           return textResult(JSON.stringify(buildContinuationEnvelope(status), null, 2));
         }

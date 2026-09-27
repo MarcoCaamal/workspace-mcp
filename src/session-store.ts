@@ -194,6 +194,35 @@ export const MAX_RECALL_LIMIT = 50;
 export const SESSION_RETENTION_DAYS = 90;
 
 /**
+ * Slice E lifecycle v2 (change harness-operability): read-time threshold for
+ * the `idle` → `archived` label. Adopted verbatim from design at Slice E
+ * apply with no operator available in the turn — this recorded constant IS
+ * the confirmation artifact; flag in review if the threshold must change.
+ * Ask-on-risk pause point, recorded in apply-progress.
+ */
+export const ARCHIVED_AFTER_DAYS = 30;
+
+/** Read-time lifecycle label for a session (Slice E). */
+export type HarnessSessionState = "live" | "idle" | "archived";
+
+/**
+ * Derives the read-time lifecycle label from a session record. `live` while
+ * `status` is `'live'`; otherwise `idle`, or `archived` once the session has
+ * been ended longer than `ARCHIVED_AFTER_DAYS`. Archived is a label, not a
+ * persisted transition — both ended labels are terminal for writes.
+ */
+export function deriveSessionState(record: SessionRecord): HarnessSessionState {
+  if (record.status === "live") {
+    return "live";
+  }
+  if (record.endedAt === null) {
+    return "idle";
+  }
+  const ageMs = Date.now() - new Date(record.endedAt).getTime();
+  return ageMs > ARCHIVED_AFTER_DAYS * 86400000 ? "archived" : "idle";
+}
+
+/**
  * Slice D bootstrap (change harness-operability): hard caps for the dynamic
  * bootstrap block returned by `session_start`/`session_resume`. Whole block
  * at most 2000 chars with the embedded latest-checkpoint summary at most 500
@@ -316,6 +345,19 @@ export interface SessionRecord {
   id: string;
   createdAt: string;
   endedAt: string | null;
+  /**
+   * Slice E lifecycle v2: persisted liveness. `'live'` for writable
+   * sessions, `'idle'` once ended. `archived` is a read-time label from
+   * {@link deriveSessionState}, never persisted.
+   */
+  status: "live" | "idle";
+  /**
+   * Slice E lifecycle v2: audit timestamp of the last explicit
+   * `session_reopen`, or null when never reopened. `endedAt` keeps the
+   * first-ended timestamp, so reopened sessions stay distinguishable from
+   * never-closed ones.
+   */
+  reopenedAt: string | null;
   /** Canonical (realpath) registered workspace bound at start. */
   primaryWorkspace: string;
 }
@@ -391,6 +433,12 @@ export interface HarnessStatusResult {
    * checkpoint: the transition is reported honestly and never gates progress.
    */
   unverified: boolean;
+  /**
+   * Slice E lifecycle v2: read-time lifecycle label of the queried session.
+   * Handlers shape read-only snapshots for ended sessions from this instead
+   * of throwing.
+   */
+  state: HarnessSessionState;
 }
 
 /**
@@ -460,6 +508,14 @@ export interface HarnessStore {
    * a session, oldest first, for the capped bootstrap block. Read-only.
    */
   listWorks(sessionId: string): WorkRecord[];
+  /**
+   * Slice E lifecycle v2 (change harness-operability): the ONLY path reviving
+   * an ended session. Sets `status = 'live'` and `reopened_at = now()` while
+   * keeping `ended_at` as the first-ended audit timestamp, and returns an
+   * explicit ended-then-reopened notice. Reopening a live session is a no-op
+   * success that records nothing.
+   */
+  reopenSession(sessionId: string): { session: SessionRecord; notice: string };
   writeStageArtifact(input: Omit<StageArtifactRecord, "id" | "createdAt">): StageArtifactRecord;
   readStageArtifact(
     artifactId: string,
@@ -772,6 +828,8 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           id: string;
           created_at: string;
           ended_at: string | null;
+          status?: string | null;
+          reopened_at?: string | null;
           primary_workspace: string;
         }
       | undefined;
@@ -782,14 +840,19 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
       id: row.id,
       createdAt: row.created_at,
       endedAt: row.ended_at,
+      status: row.status === "idle" ? "idle" : "live",
+      reopenedAt: row.reopened_at ?? null,
       primaryWorkspace: row.primary_workspace,
     };
   }
 
   function requireLiveSession(sessionId: string): SessionRecord {
     const session = readSession(sessionId);
-    if (session.endedAt !== null) {
-      throw new HarnessStoreError("closed-session", "session is closed");
+    if (session.status !== "live") {
+      throw new HarnessStoreError(
+        "closed-session",
+        "session is closed; use session_reopen to reopen it",
+      );
     }
     return session;
   }
@@ -852,6 +915,23 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
       mkdirSync(path.dirname(path.resolve(options.dbPath)), { recursive: true });
       db = new DatabaseSync(path.resolve(options.dbPath));
       db.exec(SCHEMA);
+      // Slice E lifecycle v2: idempotent column upgrade so pre-change
+      // databases gain `status`/`reopened_at` in place. Rows ended before the
+      // upgrade carry `ended_at` but no status, so they are backfilled to
+      // `'idle'` exactly once (when the column is added) — never on later
+      // opens, where reopened-live rows must keep `status = 'live'`.
+      // `ended_at` stays the first-ended audit timestamp throughout.
+      const sessionColumns = db
+        .prepare("PRAGMA table_info(sessions)")
+        .all() as Array<{ name: string }>;
+      const sessionColumnNames = new Set(sessionColumns.map((column) => column.name));
+      if (!sessionColumnNames.has("status")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'live'");
+        db.exec("UPDATE sessions SET status = 'idle' WHERE ended_at IS NOT NULL");
+      }
+      if (!sessionColumnNames.has("reopened_at")) {
+        db.exec("ALTER TABLE sessions ADD COLUMN reopened_at TEXT");
+      }
       // Backfill FTS rows for databases written before the Slice 3 triggers
       // existed; the triggers keep every later write in sync.
       db.exec(`
@@ -876,13 +956,22 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           id: randomUUID(),
           createdAt: now(),
           endedAt: null,
+          status: "live",
+          reopenedAt: null,
           primaryWorkspace: canonical,
         };
         requireOpen()
           .prepare(
-            "INSERT INTO sessions(id, created_at, ended_at, primary_workspace) VALUES (?, ?, ?, ?)",
+            "INSERT INTO sessions(id, created_at, ended_at, status, reopened_at, primary_workspace) VALUES (?, ?, ?, ?, ?, ?)",
           )
-          .run(record.id, record.createdAt, record.endedAt, record.primaryWorkspace);
+          .run(
+            record.id,
+            record.createdAt,
+            record.endedAt,
+            record.status,
+            record.reopenedAt,
+            record.primaryWorkspace,
+          );
         return record;
       } catch (error) {
         throw asStoreUnavailable(error);
@@ -892,12 +981,35 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
     endSession(sessionId: string): void {
       try {
         const session = readSession(sessionId);
-        if (session.endedAt !== null) {
+        if (session.status !== "live" || session.endedAt !== null) {
           throw new HarnessStoreError("closed-session", "session is already closed");
         }
         requireOpen()
-          .prepare("UPDATE sessions SET ended_at = ? WHERE id = ?")
+          .prepare("UPDATE sessions SET ended_at = ?, status = 'idle' WHERE id = ?")
           .run(now(), sessionId);
+      } catch (error) {
+        throw asStoreUnavailable(error);
+      }
+    },
+
+    reopenSession(sessionId: string): { session: SessionRecord; notice: string } {
+      try {
+        const session = readSession(sessionId);
+        if (session.status === "live") {
+          return {
+            session,
+            notice: `session ${sessionId} is already live; no reopen was needed`,
+          };
+        }
+        const reopenedAt = now();
+        requireOpen()
+          .prepare("UPDATE sessions SET status = 'live', reopened_at = ? WHERE id = ?")
+          .run(reopenedAt, sessionId);
+        const record: SessionRecord = { ...session, status: "live", reopenedAt };
+        return {
+          session: record,
+          notice: `session ${sessionId} was ended and is now reopened`,
+        };
       } catch (error) {
         throw asStoreUnavailable(error);
       }
@@ -927,10 +1039,10 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
 
     resume(sessionId: string, workId?: string) {
       try {
+        // Slice E lifecycle v2: ended sessions return their read-only data
+        // instead of throwing — the handler shapes the snapshot and the
+        // session stays ended until an explicit `reopenSession`.
         const session = readSession(sessionId);
-        if (session.endedAt !== null) {
-          throw new HarnessStoreError("closed-session", "session is closed");
-        }
         let work: WorkRecord | null = null;
         if (workId !== undefined) {
           work = requireWorkInSession(workId, sessionId);
@@ -987,10 +1099,10 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
 
     harnessStatus(sessionId: string, workId?: string): HarnessStatusResult {
       try {
+        // Slice E lifecycle v2: ended sessions return the same derivation
+        // with their read-time `state` instead of throwing — the handler
+        // shapes the read-only snapshot from `state`.
         const session = readSession(sessionId);
-        if (session.endedAt !== null) {
-          throw new HarnessStoreError("closed-session", "session is closed");
-        }
         if (workId !== undefined) {
           requireWorkInSession(workId, sessionId);
         }
@@ -1058,6 +1170,7 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           reason: reasons.join("; "),
           latestCheckpoint,
           unverified,
+          state: deriveSessionState(session),
         };
       } catch (error) {
         throw asStoreUnavailable(error);
@@ -1562,10 +1675,16 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
         const db = requireOpen();
         const cutoff = new Date(nowIso).getTime() - SESSION_RETENTION_DAYS * 86400000;
         const ended = db
-          .prepare("SELECT id, ended_at FROM sessions WHERE ended_at IS NOT NULL")
-          .all() as Array<{ id: string; ended_at: string }>;
+          .prepare("SELECT id, ended_at, status FROM sessions WHERE ended_at IS NOT NULL")
+          .all() as Array<{ id: string; ended_at: string; status: string | null }>;
         const purged: string[] = [];
         for (const row of ended) {
+          // Slice E lifecycle v2: reopened sessions keep `ended_at` as audit
+          // but are live again — the "live never purged" contract skips them
+          // while the ended_at 90-day rule itself is unchanged.
+          if (row.status === "live") {
+            continue;
+          }
           if (new Date(row.ended_at).getTime() < cutoff) {
             purged.push(row.id);
           }

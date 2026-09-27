@@ -218,6 +218,14 @@ function capBootstrapSummary(summary: string): string {
   return `${summary.slice(0, BOOTSTRAP_SUMMARY_MAX_CHARS)}… [truncated ${removed} chars]`;
 }
 
+/**
+ * Slice E lifecycle v2 (change harness-operability): reopen guidance carried
+ * by every ended snapshot and ended-write rejection. Names the explicit
+ * path only; carries no metric values.
+ */
+export const ENDED_SESSION_REOPEN_GUIDANCE =
+  "session is ended; call session_reopen with the session token to reopen it";
+
 export function renderHarnessRecall(input: {  stages: readonly StageArtifactRecord[];
   checkpoints: readonly CheckpointRecord[];
   enriched: readonly RecallEnrichedLine[];
