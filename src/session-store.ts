@@ -170,6 +170,12 @@ export interface ContinuationEnvelope {
     summary: string;
     truncated: boolean;
   } | null;
+  /**
+   * ODD skills-phase3: required skill for the derived next (additive,
+   * version stays 1). Sync-computable only: no loaded state (that needs
+   * file reads and stays text-only). Null when the work is complete.
+   */
+  skills: { required: string | null; nextAction: string };
 }
 
 /**
@@ -180,6 +186,8 @@ export interface ContinuationEnvelope {
  */
 export function buildContinuationEnvelope(status: HarnessStatusResult): ContinuationEnvelope {
   const checkpoint = status.latestCheckpoint;
+  const required =
+    status.next === "complete" ? null : ((STAGE_SKILLS as Record<string, string>)[status.next] ?? null);
   return {
     version: CONTINUATION_ENVELOPE_VERSION,
     next: status.next,
@@ -199,6 +207,10 @@ export function buildContinuationEnvelope(status: HarnessStatusResult): Continua
             summary: capCheckpointSummary(checkpoint.summary).text,
             truncated: capCheckpointSummary(checkpoint.summary).truncated,
           },
+    skills: {
+      required,
+      nextAction: required === null ? "close out the work" : `harness_skill get ${required}`,
+    },
   };
 }
 
@@ -411,6 +423,21 @@ export interface WorkRecord {
   createdAt: string;
 }
 
+/** One work item digested for semantic continuation (Phase 3). */
+export interface WorkDigest {
+  workId: string;
+  sessionId: string;
+  workspace: string;
+  changeId: string | null;
+  state: HarnessSessionState;
+  /** Latest checkpointed stage, or null before the first checkpoint. */
+  stage: string | null;
+  /** Latest checkpoint summary (capped), or null before the first checkpoint. */
+  summary: string | null;
+  /** Latest activity across checkpoints, artifacts, and the work row itself. */
+  updatedAt: string;
+}
+
 export interface StageArtifactRecord {
   /** External stored artifact ID; checkpoints reference this. */
   id: string;
@@ -581,6 +608,16 @@ export interface HarnessStore {
     workId: string | null | undefined,
     skillName: string,
   ): { revision: string; loadedAt: string } | null;
+  /**
+   * ODD skills-phase3: semantic continuation. `findWorks` matches works by
+   * `changeId` or latest-checkpoint-summary substring (case-insensitive);
+   * `recentWorks` orders works by latest activity with optional workspace
+   * and lifecycle-state filters. Both return one digest per work with the
+   * parent session state, latest stage/summary, and activity timestamp.
+   * Read-only; tokenless discovery surface.
+   */
+  findWorks(query: string, limit?: number): WorkDigest[];
+  recentWorks(opts?: { workspace?: string; state?: HarnessSessionState; limit?: number }): WorkDigest[];
   /** Scoped recall: session required; work/workspace narrow; never global. */
   searchCheckpoints(query: string, opts: RecallScope): CheckpointRecord[];
   searchStageArtifacts(query: string, opts: RecallScope): StageArtifactRecord[];
@@ -763,6 +800,50 @@ function clampRecallLimit(limit: number): number {
     return DEFAULT_RECALL_LIMIT;
   }
   return Math.min(MAX_RECALL_LIMIT, Math.max(1, Math.floor(limit)));
+}
+
+/** Digest list cap for semantic continuation (Phase 3). */
+const MAX_DIGEST_LIMIT = 50;
+const DEFAULT_DIGEST_LIMIT = 20;
+/** Latest-checkpoint summary cap inside digests, with explicit marker. */
+const DIGEST_SUMMARY_MAX_CHARS = 500;
+
+function clampDigestLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) {
+    return DEFAULT_DIGEST_LIMIT;
+  }
+  return Math.min(MAX_DIGEST_LIMIT, Math.max(1, Math.floor(limit)));
+}
+
+function digestOf(
+  row: {
+    work_id: string;
+    session_id: string;
+    workspace: string;
+    change_id: string | null;
+    work_created: string;
+    stage: string | null;
+    summary: string | null;
+    checkpoint_created: string | null;
+  },
+  state: HarnessSessionState,
+): WorkDigest {
+  const summary =
+    row.summary === null
+      ? null
+      : row.summary.length <= DIGEST_SUMMARY_MAX_CHARS
+        ? row.summary
+        : `${row.summary.slice(0, DIGEST_SUMMARY_MAX_CHARS)}… [truncated ${row.summary.length - DIGEST_SUMMARY_MAX_CHARS} chars]`;
+  return {
+    workId: row.work_id,
+    sessionId: row.session_id,
+    workspace: row.workspace,
+    changeId: row.change_id,
+    state,
+    stage: row.stage,
+    summary,
+    updatedAt: row.checkpoint_created ?? row.work_created,
+  };
 }
 
 /**
@@ -1465,6 +1546,62 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
       }
     },
 
+    findWorks(query, limit): WorkDigest[] {
+      try {
+        const like = `%${query.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+        const rows = requireOpen()
+          .prepare(
+            "SELECT w.id AS work_id, w.session_id, w.workspace, w.change_id, w.created_at AS work_created, " +
+              "c.completed_stage AS stage, c.summary AS summary, c.created_at AS checkpoint_created " +
+              "FROM works w LEFT JOIN checkpoints c ON c.seq = (SELECT MAX(seq) FROM checkpoints WHERE work_id = w.id) " +
+              "WHERE w.change_id LIKE ? ESCAPE '\\' OR c.summary LIKE ? ESCAPE '\\' " +
+              "ORDER BY COALESCE(c.created_at, w.created_at) DESC LIMIT ?",
+          )
+          .all(like, like, clampDigestLimit(limit)) as Array<{
+          work_id: string;
+          session_id: string;
+          workspace: string;
+          change_id: string | null;
+          work_created: string;
+          stage: string | null;
+          summary: string | null;
+          checkpoint_created: string | null;
+        }>;
+        return rows.map((row) => digestOf(row, deriveSessionState(readSession(row.session_id))));
+      } catch (error) {
+        throw asStoreUnavailable(error);
+      }
+    },
+
+    recentWorks(opts): WorkDigest[] {
+      try {
+        const db = requireOpen();
+        const where = opts?.workspace === undefined ? "" : "WHERE w.workspace = ?";
+        const params: Array<string | number> = opts?.workspace === undefined ? [] : [opts.workspace];
+        const rows = db
+          .prepare(
+            "SELECT w.id AS work_id, w.session_id, w.workspace, w.change_id, w.created_at AS work_created, " +
+              "c.completed_stage AS stage, c.summary AS summary, c.created_at AS checkpoint_created " +
+              "FROM works w LEFT JOIN checkpoints c ON c.seq = (SELECT MAX(seq) FROM checkpoints WHERE work_id = w.id) " +
+              `${where} ORDER BY COALESCE(c.created_at, w.created_at) DESC LIMIT ?`,
+          )
+          .all(...params, clampDigestLimit(opts?.limit)) as Array<{
+          work_id: string;
+          session_id: string;
+          workspace: string;
+          change_id: string | null;
+          work_created: string;
+          stage: string | null;
+          summary: string | null;
+          checkpoint_created: string | null;
+        }>;
+        const digests = rows.map((row) => digestOf(row, deriveSessionState(readSession(row.session_id))));
+        return opts?.state === undefined ? digests : digests.filter((digest) => digest.state === opts.state);
+      } catch (error) {
+        throw asStoreUnavailable(error);
+      }
+    },
+
     writeStageArtifact(input): StageArtifactRecord {
       try {
         requireLiveSession(input.sessionId);
@@ -1576,6 +1713,8 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
       try {
         requireLiveSession(input.sessionId);
         requireWorkInSession(input.workId, input.sessionId);
+        // ODD skills-phase3: task lists belong to the tasks stage.
+        requireSkillForStage(input.sessionId, input.workId, "tasks");
         const canonical = canonicalWorkspace(input.workspace);
         requireWithinCap("task body", input.body, MAX_TASK_BODY_CHARS);
         const record: HarnessTaskRecord = {

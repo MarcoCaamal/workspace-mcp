@@ -133,10 +133,13 @@ describe("slice 2 wiring: harness tool registration", () => {
         "task_write",
         "checkpoint",
         "harness_status",
+        "work_find",
+        "work_recent",
+        "feature_resume",
       ]) {
         expect(names, `expected harness tool ${expected}`).toContain(expected);
       }
-      expect(names).toHaveLength(28);
+      expect(names).toHaveLength(31);
     } finally {
       await close(session);
     }

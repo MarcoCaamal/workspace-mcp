@@ -511,3 +511,61 @@ describe("skill gate surfacing over MCP (F2)", () => {
     }
   });
 });
+
+describe("task_write gate + envelope skills (H3 RED)", () => {
+  let gated: HarnessStore;
+  let dbDir: string;
+  let wsRoot: string;
+  let dir: string;
+
+  beforeAll(async () => {
+    dbDir = await mkdtemp(path.join(tmpdir(), "workspace-mcp-skill-h3-"));
+    wsRoot = await mkdtemp(path.join(tmpdir(), "workspace-mcp-skill-h3-ws-"));
+    dir = path.join(dbDir, "skills");
+    await mkdir(path.join(dir, "sdd-tasks"), { recursive: true });
+    await writeFile(path.join(dir, "sdd-tasks", "SKILL.md"), "# Tasks\n\nBreak down.\n");
+    gated = openHarnessStore({ dbPath: path.join(dbDir, "harness.db"), workspaceRoots: [wsRoot], skillsDir: dir });
+    gated.open();
+  });
+
+  afterAll(async () => {
+    gated.close();
+    await rm(dbDir, { recursive: true, force: true });
+    await rm(wsRoot, { recursive: true, force: true });
+  });
+
+  it("rejects task_write without sdd-tasks and allows it after the load", async () => {
+    const session = gated.startSession(wsRoot);
+    const work = gated.startWork(session.id, wsRoot, "h3");
+    let message = "";
+    try {
+      gated.writeTaskList({ sessionId: session.id, workId: work.id, workspace: wsRoot, changeId: "h3", body: "t", supersedes: null });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toMatch(/skill-required/);
+    expect(message).toContain("sdd-tasks");
+    const { skillRevision } = await import("../src/session-store.js");
+    const { readFile } = await import("node:fs/promises");
+    const { default: pathMod } = await import("node:path");
+    const rev = skillRevision(await readFile(pathMod.join(dir, "sdd-tasks", "SKILL.md"), "utf8"));
+    gated.recordSkillLoad({ sessionId: session.id, workId: work.id, skillName: "sdd-tasks", revision: rev });
+    const done = gated.writeTaskList({ sessionId: session.id, workId: work.id, workspace: wsRoot, changeId: "h3", body: "t", supersedes: null });
+    expect(done.body).toBe("t");
+  });
+
+  it("envelope carries the required skill for the derived next", async () => {
+    const { buildContinuationEnvelope } = await import("../src/session-store.js");
+    const status = {
+      currentStage: "spec",
+      next: "design",
+      reason: "spec checkpointed; continue with design",
+      latestCheckpoint: null,
+      unverified: false,
+    };
+    const envelope = buildContinuationEnvelope(status as never);
+    expect(envelope.skills).toEqual({ required: "sdd-design", nextAction: "harness_skill get sdd-design" });
+    const done = buildContinuationEnvelope({ ...status, next: "complete" } as never);
+    expect(done.skills).toEqual({ required: null, nextAction: "close out the work" });
+  });
+});
