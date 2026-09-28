@@ -5,7 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createServer } from "../src/server.js";
+import { createServer, HARNESS_CHAT_SKILLS, buildInstructions } from "../src/server.js";
 import { defaultSkillsDir, resolveSkillsDir } from "../src/config.js";
 import {
   SKILL_BODY_MAX_CHARS,
@@ -14,6 +14,7 @@ import {
 import type { HarnessStore } from "../src/session-store.js";
 import { openHarnessStore } from "../src/session-store.js";
 import type { WorkspaceConfig } from "../src/workspaces.js";
+import { WorkspaceRegistry } from "../src/workspaces.js";
 
 /**
  * ODD harness-chat-skills, T1 (TDD RED): the linear harness chat needs its
@@ -152,5 +153,37 @@ describe("harness_skill registration gate", () => {
     expect(await toolNames({ session: true })).toContain("harness_skill");
     expect(await toolNames(undefined)).not.toContain("harness_skill");
     expect(await toolNames({ recall: true })).not.toContain("harness_skill");
+  });
+});
+
+describe("chat skills catalog in instructions", () => {
+  let wsRoot: string;
+
+  beforeAll(async () => {
+    wsRoot = await mkdtemp(path.join(tmpdir(), "workspace-mcp-skills-catalog-"));
+  });
+
+  afterAll(async () => {
+    await rm(wsRoot, { recursive: true, force: true });
+  });
+
+  function instructions(harness: { session?: boolean } | undefined): string {
+    const registry = new WorkspaceRegistry([{ name: "ws", path: wsRoot }]);
+    return buildInstructions(registry, undefined, harness);
+  }
+
+  it("lists every catalog skill with its trigger under harness.session", () => {
+    const text = instructions({ session: true });
+    expect(HARNESS_CHAT_SKILLS.length).toBeGreaterThan(0);
+    for (const skill of HARNESS_CHAT_SKILLS) {
+      expect(text).toContain(skill.name);
+      expect(text).toContain(skill.trigger);
+    }
+    expect(text).toContain("harness_skill");
+  });
+
+  it("omits the catalog without harness.session", () => {
+    expect(instructions(undefined)).not.toContain("Chat skills");
+    expect(instructions({})).not.toContain("Chat skills");
   });
 });

@@ -40,6 +40,22 @@ export const METRICS_BOUNDARY_SENTENCE =
   "Harness health signals are operator-local: never report coverage, cadence, " +
   "hygiene, or rework figures in chat; redirect such requests to Marco.";
 
+/**
+ * ODD harness-chat-skills, T2: MCP-local chat skill catalog (linear chat, no
+ * subagents). Each entry names the skill directory plus the trigger that
+ * calls for it. Bodies live in `<skillsDir>/<name>/SKILL.md` and load via
+ * `harness_skill get`. Keep this list identical to the seeded skills.
+ */
+export interface ChatSkillEntry {
+  readonly name: string;
+  readonly trigger: string;
+}
+
+export const HARNESS_CHAT_SKILLS: readonly ChatSkillEntry[] = [
+  { name: "work-setup", trigger: "work_start: ask mode (interactive/automatic) and delivery (single-pr/chained)" },
+  { name: "work-unit-commits", trigger: "implementation: commit splitting, chained PRs, tests with code" },
+];
+
 export interface CreateServerOptions {
   /** Named workspace roots. Each tool resolves one of them per call. */
   workspaces: WorkspaceConfig[];
@@ -158,6 +174,9 @@ export function buildInstructions(
       `- ${METRICS_BOUNDARY_SENTENCE}`,
       "- Ended sessions stay terminal for writes and serve read-only snapshots on status and resume; reopen one explicitly with session_reopen.",
       "- Jobs do not survive a server restart: after a restart every pre-restart job id reports unknown job id, while session/work/stage state resumes from the store by explicit token.",
+      "Chat skills (linear procedures, MCP-local):",
+      ...HARNESS_CHAT_SKILLS.map((skill) => `- ${skill.name}: ${skill.trigger}.`),
+      "- Load one with harness_skill get before following it; a trigger names when each applies.",
       "",
     );
   }
