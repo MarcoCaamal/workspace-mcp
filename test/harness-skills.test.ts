@@ -6,6 +6,9 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createServer, HARNESS_CHAT_SKILLS, buildInstructions } from "../src/server.js";
+import { renderBootstrapBlock } from "../src/tools/recall.js";
+import { STAGE_SKILLS } from "../src/session-store.js";
+import { HARNESS_STAGES } from "../src/session-store.js";
 import { defaultSkillsDir, resolveSkillsDir } from "../src/config.js";
 import {
   SKILL_BODY_MAX_CHARS,
@@ -210,5 +213,171 @@ describe("chat skills catalog in instructions", () => {
   it("omits the catalog without harness.session", () => {
     expect(instructions(undefined)).not.toContain("Chat skills");
     expect(instructions({})).not.toContain("Chat skills");
+  });
+
+  it("bootstrap block carries the catalog on the always-visible channel", () => {
+    const block = renderBootstrapBlock({
+      sessionId: "s",
+      primaryWorkspace: "/ws",
+      works: [],
+      latestSummary: null,
+      next: "explore",
+    });
+    for (const skill of HARNESS_CHAT_SKILLS) {
+      expect(block).toContain(skill.name);
+    }
+    expect(block).toContain("harness_skill");
+    expect(block.length).toBeLessThanOrEqual(2000);
+  });
+});
+
+describe("skill load telemetry (E1 RED)", () => {
+  let store: HarnessStore;
+  let dbDir: string;
+  let wsRoot: string;
+
+  beforeAll(async () => {
+    dbDir = await mkdtemp(path.join(tmpdir(), "workspace-mcp-skill-loads-"));
+    wsRoot = await mkdtemp(path.join(tmpdir(), "workspace-mcp-skill-loads-ws-"));
+    store = openHarnessStore({ dbPath: path.join(dbDir, "harness.db"), workspaceRoots: [wsRoot] });
+    store.open();
+  });
+
+  afterAll(async () => {
+    store.close();
+    await rm(dbDir, { recursive: true, force: true });
+    await rm(wsRoot, { recursive: true, force: true });
+  });
+
+  it("stage map covers every harness stage with an sdd skill", () => {
+    expect(Object.keys(STAGE_SKILLS).sort()).toEqual([...HARNESS_STAGES].sort());
+    for (const stage of HARNESS_STAGES) {
+      expect(STAGE_SKILLS[stage]).toBe(`sdd-${stage}`);
+    }
+  });
+
+  it("records and reads back a skill load scoped to session and work", () => {
+    const session = store.startSession(wsRoot);
+    const work = store.startWork(session.id, wsRoot, "e1");
+    expect(store.getSkillLoad(session.id, work.id, "sdd-explore")).toBeNull();
+    store.recordSkillLoad({ sessionId: session.id, workId: work.id, skillName: "sdd-explore", revision: "abc123" });
+    expect(store.getSkillLoad(session.id, work.id, "sdd-explore")).toMatchObject({ revision: "abc123" });
+    expect(store.getSkillLoad(session.id, null, "sdd-explore")).toBeNull();
+  });
+
+  it("rejects loads against unknown sessions", () => {
+    expect(() =>
+      store.recordSkillLoad({ sessionId: "nope", workId: null, skillName: "sdd-explore", revision: "r" }),
+    ).toThrow(/unknown session/);
+  });
+});
+
+describe("skill announce + get telemetry (E2 RED)", () => {
+  let store: HarnessStore;
+  let dbDir: string;
+  let wsRoot: string;
+  let dir: string;
+
+  beforeAll(async () => {
+    dbDir = await mkdtemp(path.join(tmpdir(), "workspace-mcp-skill-e2-"));
+    wsRoot = await mkdtemp(path.join(tmpdir(), "workspace-mcp-skill-e2-ws-"));
+    dir = path.join(dbDir, "skills");
+    await mkdir(path.join(dir, "sdd-explore"), { recursive: true });
+    await writeFile(path.join(dir, "sdd-explore", "SKILL.md"), "# Explore\n\nInvestigate.\n");
+    await mkdir(path.join(dir, "work-setup"), { recursive: true });
+    await writeFile(path.join(dir, "work-setup", "SKILL.md"), "# Setup\n\nAsk mode.\n");
+    store = openHarnessStore({ dbPath: path.join(dbDir, "harness.db"), workspaceRoots: [wsRoot] });
+    store.open();
+  });
+
+  afterAll(async () => {
+    store.close();
+    await rm(dbDir, { recursive: true, force: true });
+    await rm(wsRoot, { recursive: true, force: true });
+  });
+
+  async function startAndResume(): Promise<{ startText: string; resumeText: string; sessionId: string; workId: string }> {
+    const server: McpServer = createServer({ workspaces: [{ name: "ws", path: wsRoot }], version: "test", harness: { session: true, store, skillsDir: dir } });
+    const client = new Client({ name: "skill-e2-caller", version: "1.0.0" });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(ct), server.connect(st)]);
+    try {
+      const started = await client.callTool({ name: "session_start", arguments: { workspace: "ws" } });
+      const startText = (started.content as Array<{ text?: string }>).map((p) => p.text ?? "").join("\n");
+      const sessionId = startText.split("\n")[0] ?? "";
+      const worked = await client.callTool({ name: "work_start", arguments: { session: sessionId, workspace: "ws" } });
+      const workId = ((worked.content as Array<{ text?: string }>).map((p) => p.text ?? "").join("\n").split("\n")[0] ?? "").trim();
+      const resumed = await client.callTool({ name: "session_resume", arguments: { session: sessionId, work: workId } });
+      const resumeText = (resumed.content as Array<{ text?: string }>).map((p) => p.text ?? "").join("\n");
+      return { startText, resumeText, sessionId, workId };
+    } finally {
+      await client.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
+    }
+  }
+
+  it("fresh start announces work-setup as required and not loaded", async () => {
+    const { startText } = await startAndResume();
+    expect(startText).toContain("requiredSkill: work-setup");
+    expect(startText).toContain("skillLoaded: false");
+    expect(startText).toContain("nextAction: harness_skill get work-setup");
+  });
+
+  it("records a get with session/work and announces loaded on resume", async () => {
+    const { resumeText, sessionId, workId } = await startAndResume();
+    expect(resumeText).toContain("requiredSkill: sdd-explore");
+    expect(resumeText).toContain("skillLoaded: false");
+    const server: McpServer = createServer({ workspaces: [{ name: "ws", path: wsRoot }], version: "test", harness: { session: true, store, skillsDir: dir } });
+    const client = new Client({ name: "skill-e2-getter", version: "1.0.0" });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(ct), server.connect(st)]);
+    try {
+      const got = await client.callTool({ name: "harness_skill", arguments: { action: "get", name: "sdd-explore", session: sessionId, work: workId } });
+      expect(got.isError).not.toBe(true);
+    } finally {
+      await client.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
+    }
+    const server2: McpServer = createServer({ workspaces: [{ name: "ws", path: wsRoot }], version: "test", harness: { session: true, store, skillsDir: dir } });
+    const client2 = new Client({ name: "skill-e2-rechecker", version: "1.0.0" });
+    const [ct2, st2] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client2.connect(ct2), server2.connect(st2)]);
+    try {
+      const resumed = await client2.callTool({ name: "session_resume", arguments: { session: sessionId, work: workId } });
+      const text = (resumed.content as Array<{ text?: string }>).map((p) => p.text ?? "").join("\n");
+      expect(text).toContain("requiredSkill: sdd-explore");
+      expect(text).toContain("skillLoaded: true");
+    } finally {
+      await client2.close().catch(() => undefined);
+      await server2.close().catch(() => undefined);
+    }
+  });
+
+  it("flags skill_updated after the file changes", async () => {
+    const { sessionId, workId } = await startAndResume();
+    const server: McpServer = createServer({ workspaces: [{ name: "ws", path: wsRoot }], version: "test", harness: { session: true, store, skillsDir: dir } });
+    const client = new Client({ name: "skill-e2-updater", version: "1.0.0" });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(ct), server.connect(st)]);
+    try {
+      await client.callTool({ name: "harness_skill", arguments: { action: "get", name: "sdd-explore", session: sessionId, work: workId } });
+    } finally {
+      await client.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
+    }
+    await writeFile(path.join(dir, "sdd-explore", "SKILL.md"), "# Explore\n\nInvestigate thoroughly now.\n");
+    const server2: McpServer = createServer({ workspaces: [{ name: "ws", path: wsRoot }], version: "test", harness: { session: true, store, skillsDir: dir } });
+    const client2 = new Client({ name: "skill-e2-rechecker2", version: "1.0.0" });
+    const [ct2, st2] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client2.connect(ct2), server2.connect(st2)]);
+    try {
+      const resumed = await client2.callTool({ name: "session_resume", arguments: { session: sessionId, work: workId } });
+      const text = (resumed.content as Array<{ text?: string }>).map((p) => p.text ?? "").join("\n");
+      expect(text).toContain("skillLoaded: false");
+      expect(text).toContain("skill_updated");
+    } finally {
+      await client2.close().catch(() => undefined);
+      await server2.close().catch(() => undefined);
+    }
   });
 });

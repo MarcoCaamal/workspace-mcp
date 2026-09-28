@@ -1,7 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { HARNESS_STAGES, HarnessStoreError, buildContinuationEnvelope, deriveSessionState, type HarnessStore } from "../session-store.js";
+import { HARNESS_STAGES, HarnessStoreError, STAGE_SKILLS, buildContinuationEnvelope, deriveSessionState, type HarnessStore } from "../session-store.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
+import { getSkillRevision } from "./harness-skill.js";
 import {
   ENDED_SESSION_REOPEN_GUIDANCE,
   filterEnrichedLines,
@@ -94,6 +95,53 @@ function harnessErrorText(error: unknown): string {
 }
 
 /**
+ * ODD skills-enforcement-phase1: required-skill announcement. The harness
+ * state determines the skill; the agent loads it with `harness_skill get`.
+ * Lines append AFTER the capped bootstrap block — protocol lines must never
+ * truncate away. `required: null` means the work is complete (no skill).
+ */
+async function announceRequiredSkill(
+  lines: string[],
+  opts: {
+    sessionId: string;
+    workId: string | null;
+    required: string | null;
+    nextLabel: string;
+    skillsDir: string | undefined;
+    store: HarnessStore;
+  },
+): Promise<void> {
+  if (opts.required === null) {
+    lines.push("requiredSkill: none (work complete)");
+    return;
+  }
+  lines.push(`requiredSkill: ${opts.required}`);
+  if (opts.skillsDir === undefined || opts.skillsDir === "") {
+    lines.push("skillLoaded: unknown (skills directory unbound)");
+    lines.push(`nextAction: harness_skill get ${opts.required}`);
+    return;
+  }
+  let revision: string | null = null;
+  let row: { revision: string; loadedAt: string } | null = null;
+  try {
+    revision = await getSkillRevision(opts.skillsDir, opts.required);
+    row = revision === null ? null : opts.store.getSkillLoad(opts.sessionId, opts.workId, opts.required);
+  } catch {
+    lines.push("skillLoaded: unknown (load check unavailable)");
+    lines.push(`nextAction: harness_skill get ${opts.required}`);
+    return;
+  }
+  if (revision !== null && row !== null && row.revision === revision) {
+    lines.push(`skillLoaded: true (revision ${revision.slice(0, 12)})`);
+    lines.push(`nextAction: execute ${opts.nextLabel}`);
+  } else {
+    const reason = revision === null ? "skill_not_installed" : row === null ? "not_loaded" : "skill_updated";
+    lines.push(`skillLoaded: false (${reason})`);
+    lines.push(`nextAction: harness_skill get ${opts.required}`);
+  }
+}
+
+/**
  * Registers the nine harness session tools. The caller gates this on the
  * `harness.session` flag; flag-off restores pre-harness behavior (the 19
  * legacy tools only). The store is shared across stateless turns so explicit
@@ -103,6 +151,7 @@ export function registerSessionTools(
   server: McpServer,
   registry: WorkspaceRegistry,
   store: HarnessStore,
+  skillsDir?: string,
 ): void {
   server.registerTool(
     "session_start",
@@ -111,6 +160,7 @@ export function registerSessionTools(
       description:
         "Start a new harness session bound to one workspace and receive an opaque session token. " +
         "Use the token explicitly on every later harness call; tunnel or connection identifiers are never identity. " +
+        "After starting, load the announced requiredSkill with harness_skill get before beginning work. " +
         "Writes only to the outside-repo store; creates no repo-local files.",
       inputSchema: {
         workspace: workspaceArg(),
@@ -132,14 +182,23 @@ export function registerSessionTools(
           latestSummary: null,
           next: "explore",
         });
-        return textResult(
-          [
-            session.id,
-            `primaryWorkspace: ${session.primaryWorkspace}`,
-            `binding: session ${session.id} bound to ${session.primaryWorkspace}`,
-            block,
-          ].join("\n"),
-        );
+        // ODD skills-enforcement-phase1: a fresh session never carries
+        // loads, so work-setup is always required and not loaded here.
+        const lines = [
+          session.id,
+          `primaryWorkspace: ${session.primaryWorkspace}`,
+          `binding: session ${session.id} bound to ${session.primaryWorkspace}`,
+          block,
+        ];
+        await announceRequiredSkill(lines, {
+          sessionId: session.id,
+          workId: null,
+          required: "work-setup",
+          nextLabel: "begin work (work_start)",
+          skillsDir,
+          store,
+        });
+        return textResult(lines.join("\n"));
       } catch (error) {
         return errorResult(harnessErrorText(error));
       }
@@ -300,15 +359,32 @@ export function registerSessionTools(
         // block carrying every work in the session plus the latest summary
         // and the derived next action. The JSON continuation above is
         // unaffected; `next` here reuses the single store derivation.
+        const sessionWorks = store.listWorks(session);
         lines.push(
           renderBootstrapBlock({
             sessionId: resumed.session.id,
             primaryWorkspace: resumed.session.primaryWorkspace,
-            works: store.listWorks(session),
+            works: sessionWorks,
             latestSummary: resumed.latestCheckpoint?.summary ?? null,
             next: status.next,
           }),
         );
+        // ODD skills-enforcement-phase1: the derived next determines the
+        // required skill. Ended snapshots above stay untouched by design.
+        const required =
+          sessionWorks.length === 0
+            ? "work-setup"
+            : status.next === "complete"
+              ? null
+              : (STAGE_SKILLS[status.next as keyof typeof STAGE_SKILLS] ?? null);
+        await announceRequiredSkill(lines, {
+          sessionId: resumed.session.id,
+          workId: resumed.work?.id ?? null,
+          required,
+          nextLabel: `${status.next} stage`,
+          skillsDir,
+          store,
+        });
         return textResult(lines.join("\n"));
       } catch (error) {
         return errorResult(harnessErrorText(error));

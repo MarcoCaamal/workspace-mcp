@@ -115,6 +115,23 @@ export const HARNESS_STAGE_CONTRACTS: Record<
   },
 };
 
+/**
+ * ODD skills-enforcement-phase1: stage → chat-skill map. The harness state
+ * determines the required skill; the agent loads it via `harness_skill get`.
+ * Keys equal `HARNESS_STAGES` exactly (no archive stage exists in the store;
+ * `sdd-archive` stays discoverable via `list`). Co-located with the
+ * contracts table so stage-surface changes update both.
+ */
+export const STAGE_SKILLS: Record<HarnessStage, string> = {
+  explore: "sdd-explore",
+  propose: "sdd-propose",
+  spec: "sdd-spec",
+  design: "sdd-design",
+  tasks: "sdd-tasks",
+  apply: "sdd-apply",
+  verify: "sdd-verify",
+};
+
 /** Version of the opt-in JSON continuation envelope (Slice C). */
 export const CONTINUATION_ENVELOPE_VERSION = 1 as const;
 
@@ -531,6 +548,19 @@ export interface HarnessStore {
    * Performs zero writes; an unreachable store throws `store-unavailable`.
    */
   getMetricsSnapshot(): MetricsSnapshot;
+  /**
+   * ODD skills-enforcement-phase1: skill-load telemetry. `recordSkillLoad`
+   * notes that a session (optionally scoped to one work) loaded a skill body
+   * at a given content revision; unknown sessions (or works outside the
+   * session) throw `unknown-session`. `getSkillLoad` reads it back, or null
+   * when never loaded. Workloads are keyed with `workId ?? ""`.
+   */
+  recordSkillLoad(input: { sessionId: string; workId?: string | null; skillName: string; revision: string }): void;
+  getSkillLoad(
+    sessionId: string,
+    workId: string | null | undefined,
+    skillName: string,
+  ): { revision: string; loadedAt: string } | null;
   /** Scoped recall: session required; work/workspace narrow; never global. */
   searchCheckpoints(query: string, opts: RecallScope): CheckpointRecord[];
   searchStageArtifacts(query: string, opts: RecallScope): StageArtifactRecord[];
@@ -557,6 +587,11 @@ CREATE TABLE IF NOT EXISTS harness_tasks(
   id TEXT PRIMARY KEY, session_id TEXT NOT NULL, work_id TEXT NOT NULL,
   workspace TEXT NOT NULL, change_id TEXT, body TEXT NOT NULL,
   supersedes TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS skill_loads(
+  session_id TEXT NOT NULL, work_id TEXT NOT NULL DEFAULT '',
+  skill_name TEXT NOT NULL, revision TEXT NOT NULL,
+  loaded_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, work_id, skill_name));
 CREATE TABLE IF NOT EXISTS checkpoints(
   seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
   work_id TEXT NOT NULL, workspace TEXT NOT NULL, change_id TEXT,
@@ -1317,6 +1352,40 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           taskUsage,
           advisoryCaveat: METRICS_ADVISORY_CAVEAT,
         };
+      } catch (error) {
+        throw asStoreUnavailable(error);
+      }
+    },
+
+    recordSkillLoad(input): void {
+      try {
+        const db = requireOpen();
+        readSession(input.sessionId);
+        const workKey = input.workId ?? "";
+        if (workKey !== "") {
+          requireWorkInSession(workKey, input.sessionId);
+        }
+        db.prepare(
+          "INSERT INTO skill_loads(session_id, work_id, skill_name, revision, loaded_at) " +
+            "VALUES (?, ?, ?, ?, ?) " +
+            "ON CONFLICT(session_id, work_id, skill_name) DO UPDATE SET revision = excluded.revision, loaded_at = excluded.loaded_at",
+        ).run(input.sessionId, workKey, input.skillName, input.revision, now());
+      } catch (error) {
+        if (error instanceof HarnessStoreError) {
+          throw error;
+        }
+        throw asStoreUnavailable(error);
+      }
+    },
+
+    getSkillLoad(sessionId, workId, skillName) {
+      try {
+        const row = requireOpen()
+          .prepare(
+            "SELECT revision, loaded_at AS loadedAt FROM skill_loads WHERE session_id = ? AND work_id = ? AND skill_name = ?",
+          )
+          .get(sessionId, workId ?? "", skillName) as { revision: string; loadedAt: string } | undefined;
+        return row ?? null;
       } catch (error) {
         throw asStoreUnavailable(error);
       }

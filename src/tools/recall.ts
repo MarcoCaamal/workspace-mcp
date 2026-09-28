@@ -8,6 +8,7 @@ import {
 import type { CheckpointRecord, StageArtifactRecord } from "../session-store.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
 import { describeError, errorResult, textResult, workspaceArg } from "./shared.js";
+import { HARNESS_CHAT_SKILLS } from "./harness-skill.js";
 
 export function registerRecallTool(server: McpServer, registry: WorkspaceRegistry): void {
   server.registerTool(
@@ -193,6 +194,11 @@ export function renderBootstrapBlock(input: BootstrapBlockInput): string {
     input.works.length === 0
       ? "works: (none)"
       : `works: ${input.works.map((work) => `${work.id} (${work.changeId ?? "unbound"})`).join(", ")}`;
+  // ODD bootstrap-skills-discovery: the skills catalog rides the bootstrap
+  // because some clients never surface server instructions to the model.
+  // Tool responses are the proven-visible channel. No metric values here.
+  const skillsLine =
+    `skills: harness_skill list to discover, harness_skill get <name> to load (${HARNESS_CHAT_SKILLS.map((skill) => skill.name).join(", ")})`;
   const block = [
     `session: ${input.sessionId}`,
     `primaryWorkspace: ${input.primaryWorkspace}`,
@@ -200,6 +206,7 @@ export function renderBootstrapBlock(input: BootstrapBlockInput): string {
     `latestSummary: ${capBootstrapSummary(summary)}`,
     `next: ${input.next}`,
     BOOTSTRAP_TRIGGER_HINTS,
+    skillsLine,
   ].join("\n");
   if (block.length <= BOOTSTRAP_MAX_CHARS) {
     return block;
