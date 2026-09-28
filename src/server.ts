@@ -10,6 +10,7 @@ import { registerChangeTools } from "./tools/changes.js";
 import { registerEditTool } from "./tools/edit.js";
 import { registerGitTools } from "./tools/git.js";
 import { registerGrepTool } from "./tools/grep.js";
+import { registerHarnessSkillTool } from "./tools/harness-skill.js";
 import { registerJobTools } from "./tools/jobs.js";
 import { registerListTool } from "./tools/list.js";
 import { registerPatchTool } from "./tools/patch.js";
@@ -57,7 +58,7 @@ export interface CreateServerOptions {
    * byte-compatible either way. Full defaults land with the harness config
    * layer (task 3.2); these flags are the registration gates only.
    */
-  harness?: { session?: boolean; recall?: boolean; store?: HarnessStore };
+  harness?: { session?: boolean; recall?: boolean; store?: HarnessStore; skillsDir?: string };
 }
 
 /**
@@ -89,6 +90,9 @@ export function createServer({ workspaces, defaultWorkspace, version, shell, har
   registerChangeTools(server, registry);
   if (harness?.session === true && harness.store !== undefined) {
     registerSessionTools(server, registry, harness.store);
+    if (harness.skillsDir !== undefined && harness.skillsDir !== "") {
+      registerHarnessSkillTool(server, harness.skillsDir);
+    }
   }
   if (harness?.recall === true && harness.store !== undefined) {
     registerHarnessRecallTool(server, registry, harness.store);

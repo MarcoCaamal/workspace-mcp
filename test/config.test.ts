@@ -11,6 +11,7 @@ import {
   ConfigError,
   CONFIG_FILE_NAME,
   defaultHarnessDbPath,
+  defaultSkillsDir,
   discoverConfigFile,
   globalConfigPath,
   loadConfigFile,
@@ -618,7 +619,7 @@ describe("chatgpt entry profile defaults", () => {
 describe("harness config defaults", () => {
   it("defaults the harness session and recall flags off with the global harness.db path", () => {
     const resolved = mergeWith(makeLoaded({ workspaces: [{ name: "api", path: "/w/api" }] }));
-    expect(resolved.harness).toEqual({ session: false, recall: false, dbPath: defaultHarnessDbPath({}) });
+    expect(resolved.harness).toEqual({ session: false, recall: false, dbPath: defaultHarnessDbPath({}), skillsDir: defaultSkillsDir({}) });
   });
 
   it("accepts a well-formed harness section without touching workspaces", () => {
@@ -643,7 +644,7 @@ describe("harness config defaults", () => {
     const resolved = mergeWith(makeLoaded({ harness: { session: true, dbPath: "/file/harness.db" } }), {
       env: { WORKSPACE_MCP_HARNESS_DB: "/env/harness.db" },
     });
-    expect(resolved.harness).toEqual({ session: true, recall: false, dbPath: "/env/harness.db" });
+    expect(resolved.harness).toEqual({ session: true, recall: false, dbPath: "/env/harness.db", skillsDir: defaultSkillsDir({}) });
   });
 
   it("ignores a blank WORKSPACE_MCP_HARNESS_DB and keeps the file value", () => {
