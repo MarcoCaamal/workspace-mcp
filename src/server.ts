@@ -92,9 +92,9 @@ export function createServer({ workspaces, defaultWorkspace, version, shell, har
   registerGitTools(server, registry);
   registerChangeTools(server, registry);
   if (harness?.session === true && harness.store !== undefined) {
-    registerSessionTools(server, registry, harness.store);
+    registerSessionTools(server, registry, harness.store, harness.skillsDir);
     if (harness.skillsDir !== undefined && harness.skillsDir !== "") {
-      registerHarnessSkillTool(server, harness.skillsDir);
+      registerHarnessSkillTool(server, harness.skillsDir, harness.store);
     }
   }
   if (harness?.recall === true && harness.store !== undefined) {
@@ -164,6 +164,10 @@ export function buildInstructions(
       "Chat skills (linear procedures, MCP-local):",
       ...HARNESS_CHAT_SKILLS.map((skill) => `- ${skill.name}: ${skill.trigger}.`),
       "- Load one with harness_skill get before following it; a trigger names when each applies.",
+      "- On a new work session, load work-setup before beginning work.",
+      "- Before executing an SDD stage, load its skill (explore → sdd-explore, propose → sdd-propose, spec → sdd-spec, design → sdd-design, tasks → sdd-tasks, apply → sdd-apply, verify → sdd-verify, archive → sdd-archive).",
+      "- session_start and session_resume report the required skill for the next action; load it before continuing.",
+      "- Do not infer a procedure from a skill name. Load it with harness_skill get.",
       "",
     );
   }

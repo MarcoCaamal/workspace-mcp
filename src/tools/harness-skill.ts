@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { HarnessStoreError, type HarnessStore } from "../session-store.js";
 import { describeError, errorResult, textResult } from "./shared.js";
 
 /**
@@ -53,6 +55,26 @@ export const HARNESS_CHAT_SKILLS: readonly ChatSkillEntry[] = [
 
 function skillFile(skillsDir: string, name: string): string {
   return path.join(skillsDir, name, "SKILL.md");
+}
+
+/** Content revision of a skill body (sha256 hex). Loads compare against it. */
+export function skillRevision(body: string): string {
+  return createHash("sha256").update(body, "utf8").digest("hex");
+}
+
+/** Current revision of an installed skill, or null when missing/invalid. */
+export async function getSkillRevision(skillsDir: string, name: string): Promise<string | null> {
+  if (!SKILL_NAME_PATTERN.test(name)) {
+    return null;
+  }
+  try {
+    return skillRevision(await readFile(skillFile(skillsDir, name), "utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
 }
 
 /** Sorted installed skill names. A missing directory means no skills, never an error. */
@@ -110,7 +132,7 @@ const skillNameSchema = z
   .describe("Skill directory name (lowercase slug). Required for get.");
 
 /** Registers `harness_skill`. The caller gates this on `harness.session`. */
-export function registerHarnessSkillTool(server: McpServer, skillsDir: string): void {
+export function registerHarnessSkillTool(server: McpServer, skillsDir: string, store?: HarnessStore): void {
   server.registerTool(
     "harness_skill",
     {
@@ -118,14 +140,27 @@ export function registerHarnessSkillTool(server: McpServer, skillsDir: string): 
       description:
         "List or read the MCP-local chat skill library (procedures for the linear harness chat: work setup, Jira, delivery, SDD stages). " +
         "Use list to discover names, then get with an explicit name to load one body before following it. " +
-        "Skills are read-only reference; they never read or write harness sessions, works, or metrics.",
+        "Pass session (and work when scoped) on get so the harness records the load for the required-skill protocol. " +
+        "Skill files stay read-only; only the load record (name + content revision) is written. Bodies never carry session, work, or metric values.",
       inputSchema: {
         action: skillActionSchema,
         name: skillNameSchema.optional(),
+        session: z
+          .string()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe("Opaque session token. When given, records this load for the session."),
+        work: z
+          .string()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe("Opaque work token. Scopes the recorded load to one work item."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false },
     },
-    async ({ action, name }) => {
+    async ({ action, name, session, work }) => {
       try {
         if (action === "list") {
           const names = await listSkillNames(skillsDir);
@@ -140,6 +175,30 @@ export function registerHarnessSkillTool(server: McpServer, skillsDir: string): 
         const read = await readSkillBody(skillsDir, name);
         if (!read.found) {
           return errorResult(`unknown skill: ${name}`);
+        }
+        if (session !== undefined) {
+          if (store === undefined) {
+            return errorResult("skills telemetry unavailable: no harness store bound");
+          }
+          // Revision hashes the FULL body (read.body may carry the capped
+          // form); a second read keeps the cap logic in one place.
+          const revision = await getSkillRevision(skillsDir, name);
+          if (revision === null) {
+            return errorResult(`unknown skill: ${name}`);
+          }
+          try {
+            store.recordSkillLoad({
+              sessionId: session,
+              workId: work ?? null,
+              skillName: name,
+              revision,
+            });
+          } catch (error) {
+            if (error instanceof HarnessStoreError) {
+              return errorResult(error.message);
+            }
+            throw error;
+          }
         }
         return textResult(read.body);
       } catch (error) {
