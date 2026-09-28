@@ -54,6 +54,10 @@ export interface ChatSkillEntry {
 export const HARNESS_CHAT_SKILLS: readonly ChatSkillEntry[] = [
   { name: "work-setup", trigger: "work_start: ask mode (interactive/automatic) and delivery (single-pr/chained)" },
   { name: "work-unit-commits", trigger: "implementation: commit splitting, chained PRs, tests with code" },
+  { name: "jira-task", trigger: "Jira task, ticket, or issue: parent/child structure with title conventions" },
+  { name: "jira-epic", trigger: "Jira epic or large feature: overview, requirements, split into tasks" },
+  { name: "cognitive-doc-design", trigger: "guides, READMEs, RFCs, onboarding, architecture, or review-facing docs" },
+  { name: "issue-creation", trigger: "GitHub issues, bug reports, or feature requests" },
 ];
 
 export interface CreateServerOptions {

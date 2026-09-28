@@ -182,6 +182,13 @@ describe("chat skills catalog in instructions", () => {
     expect(text).toContain("harness_skill");
   });
 
+  it("catalog covers the batch-2 ports", () => {
+    const names = HARNESS_CHAT_SKILLS.map((skill) => skill.name);
+    for (const expected of ["jira-task", "jira-epic", "cognitive-doc-design", "issue-creation"]) {
+      expect(names).toContain(expected);
+    }
+  });
+
   it("omits the catalog without harness.session", () => {
     expect(instructions(undefined)).not.toContain("Chat skills");
     expect(instructions({})).not.toContain("Chat skills");
