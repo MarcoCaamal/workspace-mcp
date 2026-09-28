@@ -743,6 +743,7 @@ describe("slice C continuation: opt-in JSON envelope on the single derivation", 
           "latestSummary: spec checkpoint summary",
           "next: design",
           `triggers: "nuevo trabajo" → work_start; "continúa la sesión anterior" → session_resume with token`,
+          `skills: harness_skill list to discover, harness_skill get <name> to load (work-setup, work-unit-commits, jira-task, jira-epic, cognitive-doc-design, issue-creation, comment-writer, github-pr, chained-pr, sdd-explore, sdd-propose, sdd-spec, sdd-design, sdd-tasks, sdd-apply, sdd-verify, sdd-archive)`,
         ].join("\n"),
       );
     } finally {

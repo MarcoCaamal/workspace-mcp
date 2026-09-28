@@ -6,6 +6,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createServer, HARNESS_CHAT_SKILLS, buildInstructions } from "../src/server.js";
+import { renderBootstrapBlock } from "../src/tools/recall.js";
 import { defaultSkillsDir, resolveSkillsDir } from "../src/config.js";
 import {
   SKILL_BODY_MAX_CHARS,
@@ -210,5 +211,20 @@ describe("chat skills catalog in instructions", () => {
   it("omits the catalog without harness.session", () => {
     expect(instructions(undefined)).not.toContain("Chat skills");
     expect(instructions({})).not.toContain("Chat skills");
+  });
+
+  it("bootstrap block carries the catalog on the always-visible channel", () => {
+    const block = renderBootstrapBlock({
+      sessionId: "s",
+      primaryWorkspace: "/ws",
+      works: [],
+      latestSummary: null,
+      next: "explore",
+    });
+    for (const skill of HARNESS_CHAT_SKILLS) {
+      expect(block).toContain(skill.name);
+    }
+    expect(block).toContain("harness_skill");
+    expect(block.length).toBeLessThanOrEqual(2000);
   });
 });

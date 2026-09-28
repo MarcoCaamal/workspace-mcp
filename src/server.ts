@@ -10,7 +10,7 @@ import { registerChangeTools } from "./tools/changes.js";
 import { registerEditTool } from "./tools/edit.js";
 import { registerGitTools } from "./tools/git.js";
 import { registerGrepTool } from "./tools/grep.js";
-import { registerHarnessSkillTool } from "./tools/harness-skill.js";
+import { registerHarnessSkillTool, HARNESS_CHAT_SKILLS, type ChatSkillEntry } from "./tools/harness-skill.js";
 import { registerJobTools } from "./tools/jobs.js";
 import { registerListTool } from "./tools/list.js";
 import { registerPatchTool } from "./tools/patch.js";
@@ -40,36 +40,8 @@ export const METRICS_BOUNDARY_SENTENCE =
   "Harness health signals are operator-local: never report coverage, cadence, " +
   "hygiene, or rework figures in chat; redirect such requests to Marco.";
 
-/**
- * ODD harness-chat-skills, T2: MCP-local chat skill catalog (linear chat, no
- * subagents). Each entry names the skill directory plus the trigger that
- * calls for it. Bodies live in `<skillsDir>/<name>/SKILL.md` and load via
- * `harness_skill get`. Keep this list identical to the seeded skills.
- */
-export interface ChatSkillEntry {
-  readonly name: string;
-  readonly trigger: string;
-}
-
-export const HARNESS_CHAT_SKILLS: readonly ChatSkillEntry[] = [
-  { name: "work-setup", trigger: "work_start: ask mode (interactive/automatic) and delivery (single-pr/chained)" },
-  { name: "work-unit-commits", trigger: "implementation: commit splitting, chained PRs, tests with code" },
-  { name: "jira-task", trigger: "Jira task, ticket, or issue: parent/child structure with title conventions" },
-  { name: "jira-epic", trigger: "Jira epic or large feature: overview, requirements, split into tasks" },
-  { name: "cognitive-doc-design", trigger: "guides, READMEs, RFCs, onboarding, architecture, or review-facing docs" },
-  { name: "issue-creation", trigger: "GitHub issues, bug reports, or feature requests" },
-  { name: "comment-writer", trigger: "PR feedback, issue replies, reviews, or human-read comments" },
-  { name: "github-pr", trigger: "creating PRs, PR descriptions, or gh CLI pull requests" },
-  { name: "chained-pr", trigger: "PRs over 400 lines, stacked PRs, review slices" },
-  { name: "sdd-explore", trigger: "exploring an idea: codebase investigation, approaches, explore stage" },
-  { name: "sdd-propose", trigger: "change proposal: intent, scope, approach, propose stage" },
-  { name: "sdd-spec", trigger: "requirements with RFC 2119 keywords and Given/When/Then, spec stage" },
-  { name: "sdd-design", trigger: "technical approach with decisions and rationale, design stage" },
-  { name: "sdd-tasks", trigger: "task breakdown with workload forecast, tasks stage" },
-  { name: "sdd-apply", trigger: "implementing tasks with tests and evidence, apply stage" },
-  { name: "sdd-verify", trigger: "requested verification diagnostics, verify stage" },
-  { name: "sdd-archive", trigger: "closing a change with its honest final state, archive stage" },
-];
+export type { ChatSkillEntry };
+export { HARNESS_CHAT_SKILLS };
 
 export interface CreateServerOptions {
   /** Named workspace roots. Each tool resolves one of them per call. */

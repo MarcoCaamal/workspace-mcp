@@ -111,6 +111,7 @@ export function registerSessionTools(
       description:
         "Start a new harness session bound to one workspace and receive an opaque session token. " +
         "Use the token explicitly on every later harness call; tunnel or connection identifiers are never identity. " +
+        "After starting, call harness_skill list to discover the available chat procedures. " +
         "Writes only to the outside-repo store; creates no repo-local files.",
       inputSchema: {
         workspace: workspaceArg(),
