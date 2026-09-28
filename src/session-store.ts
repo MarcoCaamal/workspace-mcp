@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -70,6 +70,19 @@ export const HARNESS_STAGES = [
 ] as const;
 
 export type HarnessStage = (typeof HARNESS_STAGES)[number];
+
+/**
+ * ODD skills-enforcement: lowercase-slug directory names are the only skill
+ * identities; nothing else resolves to a file. Lives here (not in
+ * `tools/harness-skill.ts`) so the store can gate on it without importing
+ * the tool layer.
+ */
+export const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+
+/** Content revision of a skill body (sha256 hex). Loads compare against it. */
+export function skillRevision(body: string): string {
+  return createHash("sha256").update(body, "utf8").digest("hex");
+}
 
 /**
  * Slice C continuation (change harness-operability): single-source per-stage
@@ -329,6 +342,7 @@ export function parseEnvelope(stored: string):
 export type HarnessStoreErrorCode =
   | "unknown-session"
   | "closed-session"
+  | "skill-required"
   | "unknown-work"
   | "session-mismatch"
   | "unknown-workspace"
@@ -355,6 +369,12 @@ export interface HarnessStoreOptions {
   dbPath: string;
   /** Registered workspace roots, canonicalized; used for scope validation. */
   workspaceRoots: readonly string[];
+  /**
+   * ODD skills-enforcement-phase2: chat-skills directory enabling the
+   * stage→skill gate on `checkpoint`/`stage_write`. Absent (or blank) leaves
+   * enforcement off; loads are still recorded when the chat passes tokens.
+   */
+  skillsDir?: string;
 }
 
 export interface SessionRecord {
@@ -827,6 +847,9 @@ function isInsideAnyGitRepo(canonicalCandidate: string): boolean {
 export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
   let db: DatabaseSync | null = null;
   let roots: string[] = [];
+  // ODD skills-enforcement-phase2: optional skills directory for the
+  // stage→skill gate. Absent means enforcement off (Phase-0 behavior).
+  const skillsGateDir = options.skillsDir;
 
   function requireOpen(): DatabaseSync {
     if (db === null) {
@@ -929,6 +952,57 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
       );
     }
     return work;
+  }
+
+  /**
+   * ODD skills-enforcement-phase2: stage→skill gate for `checkpoint` and
+   * `stage_write`. The required skill must be loaded at its current content
+   * revision for (session, work). Unconfigured skills dir, unknown stages,
+   * and grandfathered pre-enforcement flows (a prior checkpoint for this
+   * work+stage with no load ever recorded here) stay allowed. Throws
+   * `skill-required` carrying the exact `harness_skill get` invocation.
+   */
+  function requireSkillForStage(sessionId: string, workId: string, stage: string): void {
+    if (skillsGateDir === undefined || skillsGateDir === "") {
+      return;
+    }
+    const skill = (STAGE_SKILLS as Record<string, string>)[stage];
+    if (skill === undefined) {
+      return;
+    }
+    let revision: string | null = null;
+    if (SKILL_NAME_PATTERN.test(skill)) {
+      try {
+        revision = skillRevision(readFileSync(path.join(skillsGateDir, skill, "SKILL.md"), "utf8"));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw asStoreUnavailable(error);
+        }
+      }
+    }
+    const row =
+      revision === null
+        ? null
+        : (requireOpen()
+            .prepare("SELECT revision FROM skill_loads WHERE session_id = ? AND work_id = ? AND skill_name = ?")
+            .get(sessionId, workId, skill) as { revision: string } | undefined) ?? null;
+    if (revision !== null && row !== null && row.revision === revision) {
+      return;
+    }
+    if (row === null) {
+      const prior = requireOpen()
+        .prepare("SELECT 1 FROM checkpoints WHERE work_id = ? AND completed_stage = ? LIMIT 1")
+        .get(workId, stage);
+      if (prior !== undefined) {
+        return;
+      }
+    }
+    const reason = revision === null ? "skill_not_installed" : row === null ? "not_loaded" : "skill_updated";
+    throw new HarnessStoreError(
+      "skill-required",
+      `skill-required: stage "${stage}" requires chat skill "${skill}" (${reason}). ` +
+        `Call: harness_skill { action: "get", name: "${skill}", session: "${sessionId}", work: "${workId}" }`,
+    );
   }
 
   return {
@@ -1402,6 +1476,7 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
             `unknown stage: ${input.stage} (valid: ${HARNESS_STAGES.join(", ")})`,
           );
         }
+        requireSkillForStage(input.sessionId, input.workId, input.stage);
         requireWithinCap("stage body", input.body, MAX_STAGE_BODY_CHARS);
         const record: StageArtifactRecord = {
           id: randomUUID(),
@@ -1619,6 +1694,7 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
             "checkpoint artifact does not belong to the presented session and work",
           );
         }
+        requireSkillForStage(input.sessionId, input.workId, input.completedStage);
         const createdAt = now();
         const result = requireOpen()
           .prepare(

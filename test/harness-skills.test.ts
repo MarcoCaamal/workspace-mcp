@@ -381,3 +381,133 @@ describe("skill announce + get telemetry (E2 RED)", () => {
     }
   });
 });
+
+describe("skill gates on stage writes (F1 RED)", () => {
+  let gated: HarnessStore;
+  let plain: HarnessStore;
+  let dbDir: string;
+  let wsRoot: string;
+  let dir: string;
+  const exploreBody = "# Explore\n\nInvestigate for gates.\n";
+
+  beforeAll(async () => {
+    dbDir = await mkdtemp(path.join(tmpdir(), "workspace-mcp-skill-gate-"));
+    wsRoot = await mkdtemp(path.join(tmpdir(), "workspace-mcp-skill-gate-ws-"));
+    dir = path.join(dbDir, "skills");
+    await mkdir(path.join(dir, "sdd-explore"), { recursive: true });
+    await writeFile(path.join(dir, "sdd-explore", "SKILL.md"), exploreBody);
+    const opts = { dbPath: path.join(dbDir, "harness.db"), workspaceRoots: [wsRoot] };
+    plain = openHarnessStore(opts);
+    plain.open();
+    gated = openHarnessStore({ ...opts, skillsDir: dir });
+    gated.open();
+  });
+
+  afterAll(async () => {
+    gated.close();
+    plain.close();
+    await rm(dbDir, { recursive: true, force: true });
+    await rm(wsRoot, { recursive: true, force: true });
+  });
+
+  function freshWork(store: HarnessStore): { sessionId: string; workId: string } {
+    const session = store.startSession(wsRoot);
+    const work = store.startWork(session.id, wsRoot, "gate");
+    return { sessionId: session.id, workId: work.id };
+  }
+
+  it("rejects stage_write without a loaded skill, naming the exact get call", () => {
+    const { sessionId, workId } = freshWork(gated);
+    let message = "";
+    try {
+      gated.writeStageArtifact({ sessionId, workId, workspace: wsRoot, changeId: "gate", stage: "explore", body: "b" });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toMatch(/skill-required/);
+    expect(message).toContain("sdd-explore");
+    expect(message).toContain(sessionId);
+    expect(message).toContain(workId);
+    expect(message).toContain("harness_skill");
+  });
+
+  it("allows stage_write after the load and rejects again after the file changes", async () => {
+    const { sessionId, workId } = freshWork(gated);
+    const { skillRevision } = await import("../src/session-store.js");
+    gated.recordSkillLoad({ sessionId, workId, skillName: "sdd-explore", revision: skillRevision(exploreBody) });
+    const artifact = gated.writeStageArtifact({ sessionId, workId, workspace: wsRoot, changeId: "gate", stage: "explore", body: "b" });
+    expect(artifact.stage).toBe("explore");
+    await writeFile(path.join(dir, "sdd-explore", "SKILL.md"), "# Explore\n\nChanged file.\n");
+    let message = "";
+    try {
+      gated.checkpoint({ sessionId, workId, workspace: wsRoot, changeId: "gate", completedStage: "explore", artifactId: artifact.id, summary: "s" });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toMatch(/skill-required/);
+    expect(message).toMatch(/skill_updated/);
+    await writeFile(path.join(dir, "sdd-explore", "SKILL.md"), exploreBody);
+  });
+
+  it("grandfathers pre-enforcement flows: prior checkpoint plus no loads stays allowed", () => {
+    const session = plain.startSession(wsRoot);
+    const work = plain.startWork(session.id, wsRoot, "legacy");
+    const first = plain.writeStageArtifact({ sessionId: session.id, workId: work.id, workspace: wsRoot, changeId: "legacy", stage: "explore", body: "old" });
+    plain.checkpoint({ sessionId: session.id, workId: work.id, workspace: wsRoot, changeId: "legacy", completedStage: "explore", artifactId: first.id, summary: "old" });
+    const second = plain.writeStageArtifact({ sessionId: session.id, workId: work.id, workspace: wsRoot, changeId: "legacy", stage: "explore", body: "older" });
+    const again = gated.checkpoint({ sessionId: session.id, workId: work.id, workspace: wsRoot, changeId: "legacy", completedStage: "explore", artifactId: second.id, summary: "older" });
+    expect(again.completedStage).toBe("explore");
+  });
+
+  it("leaves unconfigured stores on Phase-0 behavior", () => {
+    const { sessionId, workId } = freshWork(plain);
+    const artifact = plain.writeStageArtifact({ sessionId, workId, workspace: wsRoot, changeId: "plain", stage: "explore", body: "b" });
+    const done = plain.checkpoint({ sessionId, workId, workspace: wsRoot, changeId: "plain", completedStage: "explore", artifactId: artifact.id, summary: "s" });
+    expect(done.completedStage).toBe("explore");
+  });
+});
+
+describe("skill gate surfacing over MCP (F2)", () => {
+  let store: HarnessStore;
+  let dbDir: string;
+  let wsRoot: string;
+  let dir: string;
+
+  beforeAll(async () => {
+    dbDir = await mkdtemp(path.join(tmpdir(), "workspace-mcp-skill-f2-"));
+    wsRoot = await mkdtemp(path.join(tmpdir(), "workspace-mcp-skill-f2-ws-"));
+    dir = path.join(dbDir, "skills");
+    await mkdir(path.join(dir, "sdd-explore"), { recursive: true });
+    await writeFile(path.join(dir, "sdd-explore", "SKILL.md"), "# Explore\n\nF2.\n");
+    store = openHarnessStore({ dbPath: path.join(dbDir, "harness.db"), workspaceRoots: [wsRoot], skillsDir: dir });
+    store.open();
+  });
+
+  afterAll(async () => {
+    store.close();
+    await rm(dbDir, { recursive: true, force: true });
+    await rm(wsRoot, { recursive: true, force: true });
+  });
+
+  it("stage_write rejection carries the exact harness_skill get invocation", async () => {
+    const server: McpServer = createServer({ workspaces: [{ name: "ws", path: wsRoot }], version: "test", harness: { session: true, store, skillsDir: dir } });
+    const client = new Client({ name: "skill-f2-caller", version: "1.0.0" });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(ct), server.connect(st)]);
+    try {
+      const started = await client.callTool({ name: "session_start", arguments: { workspace: "ws" } });
+      const sessionId = ((started.content as Array<{ text?: string }>).map((p) => p.text ?? "").join("\n").split("\n")[0] ?? "").trim();
+      const worked = await client.callTool({ name: "work_start", arguments: { session: sessionId, workspace: "ws" } });
+      const workId = ((worked.content as Array<{ text?: string }>).map((p) => p.text ?? "").join("\n").split("\n")[0] ?? "").trim();
+      const written = await client.callTool({ name: "stage_write", arguments: { session: sessionId, work: workId, workspace: "ws", stage: "explore", body: "unloaded" } });
+      const text = (written.content as Array<{ text?: string }>).map((p) => p.text ?? "").join("\n");
+      expect(written.isError).toBe(true);
+      expect(text).toContain('harness_skill { action: "get", name: "sdd-explore"');
+      expect(text).toContain(sessionId);
+      expect(text).toContain(workId);
+    } finally {
+      await client.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
+    }
+  });
+});

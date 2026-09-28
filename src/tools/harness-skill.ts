@@ -1,10 +1,10 @@
-import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { HarnessStoreError, type HarnessStore } from "../session-store.js";
+import { HarnessStoreError, SKILL_NAME_PATTERN, skillRevision, type HarnessStore } from "../session-store.js";
 import { describeError, errorResult, textResult } from "./shared.js";
+export { SKILL_NAME_PATTERN, skillRevision };
 
 /**
  * MCP-local chat skills (ODD harness-chat-skills, T1).
@@ -16,8 +16,6 @@ import { describeError, errorResult, textResult } from "./shared.js";
  * is ever written here by the MCP, and skill contents never enter the repo.
  */
 
-/** Skill names are lowercase slug directories; nothing else resolves. */
-export const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 /** Bodies larger than this are truncated with an explicit marker, never cut silently. */
 export const SKILL_BODY_MAX_CHARS = 32768;
 
@@ -55,11 +53,6 @@ export const HARNESS_CHAT_SKILLS: readonly ChatSkillEntry[] = [
 
 function skillFile(skillsDir: string, name: string): string {
   return path.join(skillsDir, name, "SKILL.md");
-}
-
-/** Content revision of a skill body (sha256 hex). Loads compare against it. */
-export function skillRevision(body: string): string {
-  return createHash("sha256").update(body, "utf8").digest("hex");
 }
 
 /** Current revision of an installed skill, or null when missing/invalid. */
