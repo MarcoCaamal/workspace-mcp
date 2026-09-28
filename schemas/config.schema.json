@@ -128,6 +128,11 @@
           "type": "string",
           "minLength": 1,
           "description": "Explicit harness database file path. WORKSPACE_MCP_HARNESS_DB wins when set. Defaults to $XDG_CONFIG_HOME/workspace-mcp/harness.db (or ~/.config/workspace-mcp/harness.db)."
+        },
+        "skillsDir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Explicit MCP-local chat skills directory (<name>/SKILL.md files, read-only for the chat). Defaults to $XDG_CONFIG_HOME/workspace-mcp/skills (or ~/.config/workspace-mcp/skills)."
         }
       }
     }

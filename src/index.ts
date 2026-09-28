@@ -193,7 +193,7 @@ async function runStdio(
   defaultWorkspace: string,
   version: string,
   shell: ShellConfig,
-  harness?: { session?: boolean; recall?: boolean; store?: HarnessStore },
+  harness?: { session?: boolean; recall?: boolean; store?: HarnessStore; skillsDir?: string },
 ): Promise<void> {
   // Harness sessions are explicit tokens only (change chatgpt-workspace-harness):
   // continuity is by server-issued session/work token resolved inside
@@ -232,7 +232,7 @@ async function runHttp(
   workspaces: WorkspaceConfig[],
   defaultWorkspace: string,
   version: string,
-  harness?: { session?: boolean; recall?: boolean; store?: HarnessStore },
+  harness?: { session?: boolean; recall?: boolean; store?: HarnessStore; skillsDir?: string },
 ): Promise<void> {
   if (token === undefined && !isLoopbackHost(transport.host)) {
     log(
@@ -432,7 +432,7 @@ async function main(): Promise<void> {
   // failures are explicit store-unavailable errors with no repo-local
   // fallback. The optionals (Engram, obsidian-mcp) are never opened here, so
   // startup never requires them; recall marks them degraded instead.
-  let harness: { session: boolean; recall: boolean; store: HarnessStore } | undefined;
+  let harness: { session: boolean; recall: boolean; store: HarnessStore; skillsDir: string } | undefined;
   if (resolved.harness.session || resolved.harness.recall) {
     const store = openHarnessStore({
       dbPath: resolved.harness.dbPath,
@@ -445,7 +445,7 @@ async function main(): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    harness = { session: resolved.harness.session, recall: resolved.harness.recall, store };
+    harness = { session: resolved.harness.session, recall: resolved.harness.recall, store, skillsDir: resolved.harness.skillsDir };
     if (resolved.harness.session) {
       log(`harness sessions enabled (store: ${resolved.harness.dbPath})`);
     }

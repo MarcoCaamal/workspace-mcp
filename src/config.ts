@@ -73,6 +73,11 @@ export interface HarnessFileSettings {
   recall?: boolean;
   /** Explicit database file path; `WORKSPACE_MCP_HARNESS_DB` wins when set. */
   dbPath?: string;
+  /**
+   * Explicit chat-skills directory; defaults to the global
+   * `skills` folder beside `harness.db`. Read-only for the chat.
+   */
+  skillsDir?: string;
 }
 
 /** Validated config file contents. Workspace paths are absolute and real. */
@@ -112,7 +117,7 @@ export interface ResolvedConfig {
    * explicit config/env override or the global `harness.db` default, so it
    * is always an absolute path.
    */
-  harness: { session: boolean; recall: boolean; dbPath: string };
+  harness: { session: boolean; recall: boolean; dbPath: string; skillsDir: string };
   /** Absolute path of the config file in use, when any. */
   configPath: string | undefined;
 }
@@ -134,7 +139,7 @@ const SHELL_KEYS: readonly string[] = ["mode", "allow", "deny", "timeoutMs", "ma
 const TRANSPORT_KEYS: readonly string[] = ["type", "host", "port"];
 const STATE_KEYS: readonly string[] = ["journalMaxBytes"];
 const CHATGPT_KEYS: readonly string[] = ["preset", "primary"];
-const HARNESS_KEYS: readonly string[] = ["session", "recall", "dbPath"];
+const HARNESS_KEYS: readonly string[] = ["session", "recall", "dbPath", "skillsDir"];
 const SHELL_MODES: readonly string[] = ["allowlist", "any"];
 
 /** Reads and validates a config file. Throws {@link ConfigError} when unusable. */
@@ -526,6 +531,12 @@ function parseHarness(value: unknown): HarnessFileSettings {
     }
     harness.dbPath = value.dbPath;
   }
+  if (value.skillsDir !== undefined) {
+    if (typeof value.skillsDir !== "string" || value.skillsDir.trim() === "") {
+      throw new ConfigError(`invalid harness.skillsDir: ${JSON.stringify(value.skillsDir)} (expected a non-empty path)`);
+    }
+    harness.skillsDir = value.skillsDir;
+  }
   return harness;
 }
 
@@ -608,6 +619,29 @@ export function resolveHarnessDbPath(
 }
 
 /**
+ * Default chat-skills directory: `$XDG_CONFIG_HOME/workspace-mcp/skills`,
+ * or `~/.config/workspace-mcp/skills` when `XDG_CONFIG_HOME` is unset.
+ * The chat only reads skill files; nothing is ever written there by the MCP.
+ */
+export function defaultSkillsDir(env: NodeJS.ProcessEnv = process.env): string {
+  const xdg = env.XDG_CONFIG_HOME?.trim();
+  const home = env.HOME?.trim();
+  const base = xdg !== undefined && xdg !== "" ? xdg : path.join(home !== undefined && home !== "" ? home : homedir(), ".config");
+  return path.join(base, "workspace-mcp", "skills");
+}
+
+/**
+ * Skills directory precedence: config-file `harness.skillsDir` >
+ * global `skills` default. Pure: it never touches the filesystem.
+ */
+export function resolveSkillsDir(
+  fileSkillsDir: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return fileSkillsDir ?? defaultSkillsDir(env);
+}
+
+/**
  * Harness precedence: env/file/defaults with both flags defaulting off, so
  * disabling `harness.session` restores the pre-harness tool surface. There
  * is no CLI flag for the harness: explicit configuration or the environment
@@ -616,11 +650,12 @@ export function resolveHarnessDbPath(
 export function resolveHarnessConfig(
   file: HarnessFileSettings | undefined,
   env: NodeJS.ProcessEnv = process.env,
-): { session: boolean; recall: boolean; dbPath: string } {
+): { session: boolean; recall: boolean; dbPath: string; skillsDir: string } {
   return {
     session: file?.session ?? false,
     recall: file?.recall ?? false,
     dbPath: resolveHarnessDbPath(file?.dbPath, env),
+    skillsDir: resolveSkillsDir(file?.skillsDir, env),
   };
 }
 
