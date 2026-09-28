@@ -92,3 +92,53 @@ describe("semantic continuation discovery", () => {
     expect(text).toMatch(/no feature|not found/i);
   });
 });
+
+describe("advisory fixes (H4 RED)", () => {
+  let store2: HarnessStore;
+  let dbDir2: string;
+  let ws2: string;
+
+  beforeAll(async () => {
+    dbDir2 = await mkdtemp(path.join(tmpdir(), "workspace-mcp-discovery-h4-"));
+    ws2 = await mkdtemp(path.join(tmpdir(), "workspace-mcp-discovery-h4-ws-"));
+    store2 = openHarnessStore({ dbPath: path.join(dbDir2, "harness.db"), workspaceRoots: [ws2] });
+    store2.open();
+    const s1 = store2.startSession(ws2);
+    store2.startWork(s1.id, ws2, "H4-live-one");
+    const s2 = store2.startSession(ws2);
+    store2.startWork(s2.id, ws2, "H4-live-two");
+    const s3 = store2.startSession(ws2);
+    const w3 = store2.startWork(s3.id, ws2, "H4-done");
+    store2.endSession(s3.id);
+    void w3;
+  });
+
+  afterAll(async () => {
+    store2.close();
+    await rm(dbDir2, { recursive: true, force: true });
+    await rm(ws2, { recursive: true, force: true });
+  });
+
+  it("state filter applies before the limit", () => {
+    const ended = store2.recentWorks({ state: "idle", limit: 1 });
+    expect(ended.length).toBe(1);
+    expect(ended[0]?.changeId).toBe("H4-done");
+  });
+
+  it("feature_resume header names every distinct reference", async () => {
+    const server: McpServer = createServer({ workspaces: [{ name: "ws", path: ws2 }], version: "test", harness: { session: true, store: store2 } });
+    const client = new Client({ name: "h4-caller", version: "1.0.0" });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(ct), server.connect(st)]);
+    try {
+      const result = await client.callTool({ name: "feature_resume", arguments: { query: "H4-" } });
+      const text = (result.content as Array<{ text?: string }>).map((p) => p.text ?? "").join("\n");
+      expect(result.isError ?? false).toBe(false);
+      expect(text).toContain("H4-live-one");
+      expect(text).toContain("H4-done");
+    } finally {
+      await client.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
+    }
+  });
+});

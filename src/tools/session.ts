@@ -655,16 +655,25 @@ export function registerSessionTools(
         if (digests.length === 0) {
           return errorResult(`no feature found for "${query}" — try work_find with a broader query`);
         }
-        const lines = [`feature: ${digests[0]?.changeId} (${digests.length} workstreams)`];
+        const refs = [...new Set(digests.map((digest) => digest.changeId ?? "(unbound)"))];
+        const lines = [`feature: ${refs.join(", ")} (${digests.length} workstreams)`];
         const required = new Set<string>();
         let suggested: string | null = null;
         for (const digest of digests) {
-          const status = store.harnessStatus(digest.sessionId, digest.workId);
           lines.push(
-            `work: ${digest.workId} session: ${digest.sessionId} workspace: ${digest.workspace} state: ${digest.state} stage: ${digest.stage ?? "(none)"}`,
+            `work: ${digest.workId} session: ${digest.sessionId} workspace: ${digest.workspace} state: ${digest.state} stage: ${digest.stage ?? "(none)"} changeId: ${digest.changeId ?? "(unbound)"}`,
             `  summary: ${digest.summary ?? "(none)"}`,
-            `  next: ${status.next}`,
           );
+          // H4 R3-002: one unreadable workstream degrades to an explicit
+          // marker instead of failing the whole tokenless discovery call.
+          let status;
+          try {
+            status = store.harnessStatus(digest.sessionId, digest.workId);
+          } catch (error) {
+            lines.push(`  unreadable: ${harnessErrorText(error)}`);
+            continue;
+          }
+          lines.push(`  next: ${status.next}`);
           if (status.next !== "complete") {
             const skill = STAGE_SKILLS[status.next as keyof typeof STAGE_SKILLS];
             if (skill !== undefined) {

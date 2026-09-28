@@ -807,6 +807,15 @@ const MAX_DIGEST_LIMIT = 50;
 const DEFAULT_DIGEST_LIMIT = 20;
 /** Latest-checkpoint summary cap inside digests, with explicit marker. */
 const DIGEST_SUMMARY_MAX_CHARS = 500;
+/**
+ * Shared work-digest projection (H4 R2-001): columns and join live here once.
+ * The FROM clause stays separate so callers can append select expressions.
+ */
+const DIGEST_COLUMNS =
+  "w.id AS work_id, w.session_id, w.workspace, w.change_id, w.created_at AS work_created, " +
+  "c.completed_stage AS stage, c.summary AS summary, c.created_at AS checkpoint_created";
+const DIGEST_FROM =
+  "FROM works w LEFT JOIN checkpoints c ON c.seq = (SELECT MAX(seq) FROM checkpoints WHERE work_id = w.id)";
 
 function clampDigestLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) {
@@ -1551,9 +1560,7 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
         const like = `%${query.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
         const rows = requireOpen()
           .prepare(
-            "SELECT w.id AS work_id, w.session_id, w.workspace, w.change_id, w.created_at AS work_created, " +
-              "c.completed_stage AS stage, c.summary AS summary, c.created_at AS checkpoint_created " +
-              "FROM works w LEFT JOIN checkpoints c ON c.seq = (SELECT MAX(seq) FROM checkpoints WHERE work_id = w.id) " +
+            `SELECT ${DIGEST_COLUMNS} ${DIGEST_FROM} ` +
               "WHERE w.change_id LIKE ? ESCAPE '\\' OR c.summary LIKE ? ESCAPE '\\' " +
               "ORDER BY COALESCE(c.created_at, w.created_at) DESC LIMIT ?",
           )
@@ -1576,14 +1583,29 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
     recentWorks(opts): WorkDigest[] {
       try {
         const db = requireOpen();
-        const where = opts?.workspace === undefined ? "" : "WHERE w.workspace = ?";
-        const params: Array<string | number> = opts?.workspace === undefined ? [] : [opts.workspace];
+        // H4 R2-002/R3-001: the lifecycle filter applies in SQL BEFORE the
+        // limit (not in memory after it), or a filtered query returns fewer
+        // rows than requested. The CASE mirrors deriveSessionState; the 30-day
+        // bound duplicates ARCHIVED_AFTER_DAYS by design (SQL cannot call it).
+        const stateCase =
+          "CASE WHEN s.status = 'live' THEN 'live' WHEN s.ended_at IS NULL THEN 'idle' " +
+          "WHEN (julianday('now') - julianday(s.ended_at)) > 30 THEN 'archived' ELSE 'idle' END";
+        const filters: string[] = [];
+        const params: Array<string | number> = [];
+        if (opts?.workspace !== undefined) {
+          filters.push("w.workspace = ?");
+          params.push(opts.workspace);
+        }
+        if (opts?.state !== undefined) {
+          filters.push(`(${stateCase}) = ?`);
+          params.push(opts.state);
+        }
         const rows = db
           .prepare(
-            "SELECT w.id AS work_id, w.session_id, w.workspace, w.change_id, w.created_at AS work_created, " +
-              "c.completed_stage AS stage, c.summary AS summary, c.created_at AS checkpoint_created " +
-              "FROM works w LEFT JOIN checkpoints c ON c.seq = (SELECT MAX(seq) FROM checkpoints WHERE work_id = w.id) " +
-              `${where} ORDER BY COALESCE(c.created_at, w.created_at) DESC LIMIT ?`,
+            `SELECT ${DIGEST_COLUMNS}, ${stateCase} AS state ` +
+              `${DIGEST_FROM.replace("FROM works w", "FROM works w JOIN sessions s ON s.id = w.session_id")} ` +
+              `${filters.length > 0 ? `WHERE ${filters.join(" AND ")} ` : ""}` +
+              `ORDER BY COALESCE(checkpoint_created, work_created) DESC LIMIT ?`,
           )
           .all(...params, clampDigestLimit(opts?.limit)) as Array<{
           work_id: string;
@@ -1594,9 +1616,23 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
           stage: string | null;
           summary: string | null;
           checkpoint_created: string | null;
+          state: HarnessSessionState;
         }>;
-        const digests = rows.map((row) => digestOf(row, deriveSessionState(readSession(row.session_id))));
-        return opts?.state === undefined ? digests : digests.filter((digest) => digest.state === opts.state);
+        return rows.map((row) =>
+          digestOf(
+            {
+              work_id: row.work_id,
+              session_id: row.session_id,
+              workspace: row.workspace,
+              change_id: row.change_id,
+              work_created: row.work_created,
+              stage: row.stage,
+              summary: row.summary,
+              checkpoint_created: row.checkpoint_created,
+            },
+            row.state,
+          ),
+        );
       } catch (error) {
         throw asStoreUnavailable(error);
       }
