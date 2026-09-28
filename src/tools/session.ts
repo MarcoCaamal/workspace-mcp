@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { HARNESS_STAGES, HarnessStoreError, STAGE_SKILLS, buildContinuationEnvelope, deriveSessionState, type HarnessStore } from "../session-store.js";
+import { HARNESS_STAGES, HarnessStoreError, STAGE_SKILLS, buildContinuationEnvelope, deriveSessionState, type HarnessStore, type WorkDigest } from "../session-store.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
 import { getSkillRevision } from "./harness-skill.js";
 import {
@@ -92,6 +92,22 @@ function harnessErrorText(error: unknown): string {
     return `${error.code}: ${error.message}`;
   }
   return describeError(error);
+}
+
+/**
+ * ODD skills-phase3: one digest block per work for tokenless discovery
+ * (`work_find`, `work_recent`). Bodies never carry metric values.
+ */
+function renderWorkDigests(digests: WorkDigest[]): string {
+  const lines = [`Works (${digests.length}):`];
+  for (const digest of digests) {
+    lines.push(
+      `work: ${digest.workId} session: ${digest.sessionId} workspace: ${digest.workspace} state: ${digest.state} stage: ${digest.stage ?? "(none)"} updated: ${digest.updatedAt}`,
+      `  changeId: ${digest.changeId ?? "(unbound)"}`,
+      `  summary: ${digest.summary ?? "(none)"}`,
+    );
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -556,6 +572,118 @@ export function registerSessionTools(
           `unverified: ${status.unverified}`,
           ...renderCheckpointLines(status.latestCheckpoint),
         ];
+        return textResult(lines.join("\n"));
+      } catch (error) {
+        return errorResult(harnessErrorText(error));
+      }
+    },
+  );
+
+  server.registerTool(
+    "work_find",
+    {
+      title: "Find harness works",
+      description:
+        "Search harness works by changeId or latest-checkpoint-summary substring, across sessions, without any token. " +
+        "Use it to recover work continuations by feature name (e.g. FOOD-47) instead of pasting UUIDs. " +
+        "Read-only discovery; follow up with session_resume using a returned session token, or session_start for a new episode.",
+      inputSchema: {
+        query: z.string().min(1).max(200).describe("Substring matched against changeId and latest checkpoint summary."),
+        limit: z.number().int().min(1).max(50).optional().describe("Maximum works to return. Defaults to 20."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ query, limit }) => {
+      try {
+        const digests = store.findWorks(query, limit);
+        if (digests.length === 0) {
+          return textResult(`No works match "${query}". Try work_recent for active work.`);
+        }
+        return textResult(renderWorkDigests(digests));
+      } catch (error) {
+        return errorResult(harnessErrorText(error));
+      }
+    },
+  );
+
+  server.registerTool(
+    "work_recent",
+    {
+      title: "List recent harness works",
+      description:
+        "List harness works ordered by latest activity, without any token. " +
+        "Optionally narrow to one workspace or lifecycle state. " +
+        "Read-only discovery; follow up with session_resume using a returned session token.",
+      inputSchema: {
+        workspace: workspaceArg(),
+        state: z.enum(["live", "idle", "archived"]).optional().describe("Lifecycle-state filter."),
+        limit: z.number().int().min(1).max(50).optional().describe("Maximum works to return. Defaults to 20."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ workspace, state, limit }) => {
+      try {
+        const canonical = workspace === undefined ? undefined : registry.resolve(workspace).root;
+        const digests = store.recentWorks({ workspace: canonical, state, limit });
+        if (digests.length === 0) {
+          return textResult("No works recorded yet.");
+        }
+        return textResult(renderWorkDigests(digests));
+      } catch (error) {
+        return errorResult(harnessErrorText(error));
+      }
+    },
+  );
+
+  server.registerTool(
+    "feature_resume",
+    {
+      title: "Resume a feature by reference",
+      description:
+        "Reconstruct a feature's continuation from a human reference (e.g. FOOD-47) without any token or UUID. " +
+        "Aggregates every matching workstream with state, stage, latest summary, derived next action, required skills, and one suggested nextAction. " +
+        "Creates nothing: follow up with session_resume using a returned session token, or session_start for a new episode. " +
+        "Bodies never carry measured health figures.",
+      inputSchema: {
+        query: z.string().min(1).max(200).describe("Feature reference matched against changeId (e.g. FOOD-47)."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ query }) => {
+      try {
+        const digests = store.findWorks(query, 50).filter((digest) => digest.changeId !== null);
+        if (digests.length === 0) {
+          return errorResult(`no feature found for "${query}" — try work_find with a broader query`);
+        }
+        const refs = [...new Set(digests.map((digest) => digest.changeId ?? "(unbound)"))];
+        const lines = [`feature: ${refs.join(", ")} (${digests.length} workstreams)`];
+        const required = new Set<string>();
+        let suggested: string | null = null;
+        for (const digest of digests) {
+          lines.push(
+            `work: ${digest.workId} session: ${digest.sessionId} workspace: ${digest.workspace} state: ${digest.state} stage: ${digest.stage ?? "(none)"} changeId: ${digest.changeId ?? "(unbound)"}`,
+            `  summary: ${digest.summary ?? "(none)"}`,
+          );
+          // H4 R3-002: one unreadable workstream degrades to an explicit
+          // marker instead of failing the whole tokenless discovery call.
+          let status;
+          try {
+            status = store.harnessStatus(digest.sessionId, digest.workId);
+          } catch (error) {
+            lines.push(`  unreadable: ${harnessErrorText(error)}`);
+            continue;
+          }
+          lines.push(`  next: ${status.next}`);
+          if (status.next !== "complete") {
+            const skill = STAGE_SKILLS[status.next as keyof typeof STAGE_SKILLS];
+            if (skill !== undefined) {
+              required.add(skill);
+            }
+            suggested ??= `continue ${digest.workspace} at ${status.next} via session_resume`;
+          }
+        }
+        lines.push(`requiredSkills: ${[...required].join(", ") || "(none — all complete)"}`);
+        lines.push(`nextAction: ${suggested ?? "close out the feature"}`);
         return textResult(lines.join("\n"));
       } catch (error) {
         return errorResult(harnessErrorText(error));

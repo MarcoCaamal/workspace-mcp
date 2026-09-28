@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -70,6 +70,19 @@ export const HARNESS_STAGES = [
 ] as const;
 
 export type HarnessStage = (typeof HARNESS_STAGES)[number];
+
+/**
+ * ODD skills-enforcement: lowercase-slug directory names are the only skill
+ * identities; nothing else resolves to a file. Lives here (not in
+ * `tools/harness-skill.ts`) so the store can gate on it without importing
+ * the tool layer.
+ */
+export const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+
+/** Content revision of a skill body (sha256 hex). Loads compare against it. */
+export function skillRevision(body: string): string {
+  return createHash("sha256").update(body, "utf8").digest("hex");
+}
 
 /**
  * Slice C continuation (change harness-operability): single-source per-stage
@@ -157,6 +170,12 @@ export interface ContinuationEnvelope {
     summary: string;
     truncated: boolean;
   } | null;
+  /**
+   * ODD skills-phase3: required skill for the derived next (additive,
+   * version stays 1). Sync-computable only: no loaded state (that needs
+   * file reads and stays text-only). Null when the work is complete.
+   */
+  skills: { required: string | null; nextAction: string };
 }
 
 /**
@@ -167,6 +186,8 @@ export interface ContinuationEnvelope {
  */
 export function buildContinuationEnvelope(status: HarnessStatusResult): ContinuationEnvelope {
   const checkpoint = status.latestCheckpoint;
+  const required =
+    status.next === "complete" ? null : ((STAGE_SKILLS as Record<string, string>)[status.next] ?? null);
   return {
     version: CONTINUATION_ENVELOPE_VERSION,
     next: status.next,
@@ -186,6 +207,10 @@ export function buildContinuationEnvelope(status: HarnessStatusResult): Continua
             summary: capCheckpointSummary(checkpoint.summary).text,
             truncated: capCheckpointSummary(checkpoint.summary).truncated,
           },
+    skills: {
+      required,
+      nextAction: required === null ? "close out the work" : `harness_skill get ${required}`,
+    },
   };
 }
 
@@ -329,6 +354,7 @@ export function parseEnvelope(stored: string):
 export type HarnessStoreErrorCode =
   | "unknown-session"
   | "closed-session"
+  | "skill-required"
   | "unknown-work"
   | "session-mismatch"
   | "unknown-workspace"
@@ -355,6 +381,12 @@ export interface HarnessStoreOptions {
   dbPath: string;
   /** Registered workspace roots, canonicalized; used for scope validation. */
   workspaceRoots: readonly string[];
+  /**
+   * ODD skills-enforcement-phase2: chat-skills directory enabling the
+   * stage→skill gate on `checkpoint`/`stage_write`. Absent (or blank) leaves
+   * enforcement off; loads are still recorded when the chat passes tokens.
+   */
+  skillsDir?: string;
 }
 
 export interface SessionRecord {
@@ -389,6 +421,21 @@ export interface WorkRecord {
   /** References (not replaces) the SDD-lite change within `workspace`. */
   changeId: string | null;
   createdAt: string;
+}
+
+/** One work item digested for semantic continuation (Phase 3). */
+export interface WorkDigest {
+  workId: string;
+  sessionId: string;
+  workspace: string;
+  changeId: string | null;
+  state: HarnessSessionState;
+  /** Latest checkpointed stage, or null before the first checkpoint. */
+  stage: string | null;
+  /** Latest checkpoint summary (capped), or null before the first checkpoint. */
+  summary: string | null;
+  /** Latest activity across checkpoints, artifacts, and the work row itself. */
+  updatedAt: string;
 }
 
 export interface StageArtifactRecord {
@@ -561,6 +608,16 @@ export interface HarnessStore {
     workId: string | null | undefined,
     skillName: string,
   ): { revision: string; loadedAt: string } | null;
+  /**
+   * ODD skills-phase3: semantic continuation. `findWorks` matches works by
+   * `changeId` or latest-checkpoint-summary substring (case-insensitive);
+   * `recentWorks` orders works by latest activity with optional workspace
+   * and lifecycle-state filters. Both return one digest per work with the
+   * parent session state, latest stage/summary, and activity timestamp.
+   * Read-only; tokenless discovery surface.
+   */
+  findWorks(query: string, limit?: number): WorkDigest[];
+  recentWorks(opts?: { workspace?: string; state?: HarnessSessionState; limit?: number }): WorkDigest[];
   /** Scoped recall: session required; work/workspace narrow; never global. */
   searchCheckpoints(query: string, opts: RecallScope): CheckpointRecord[];
   searchStageArtifacts(query: string, opts: RecallScope): StageArtifactRecord[];
@@ -745,6 +802,59 @@ function clampRecallLimit(limit: number): number {
   return Math.min(MAX_RECALL_LIMIT, Math.max(1, Math.floor(limit)));
 }
 
+/** Digest list cap for semantic continuation (Phase 3). */
+const MAX_DIGEST_LIMIT = 50;
+const DEFAULT_DIGEST_LIMIT = 20;
+/** Latest-checkpoint summary cap inside digests, with explicit marker. */
+const DIGEST_SUMMARY_MAX_CHARS = 500;
+/**
+ * Shared work-digest projection (H4 R2-001): columns and join live here once.
+ * The FROM clause stays separate so callers can append select expressions.
+ */
+const DIGEST_COLUMNS =
+  "w.id AS work_id, w.session_id, w.workspace, w.change_id, w.created_at AS work_created, " +
+  "c.completed_stage AS stage, c.summary AS summary, c.created_at AS checkpoint_created";
+const DIGEST_FROM =
+  "FROM works w LEFT JOIN checkpoints c ON c.seq = (SELECT MAX(seq) FROM checkpoints WHERE work_id = w.id)";
+
+function clampDigestLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) {
+    return DEFAULT_DIGEST_LIMIT;
+  }
+  return Math.min(MAX_DIGEST_LIMIT, Math.max(1, Math.floor(limit)));
+}
+
+function digestOf(
+  row: {
+    work_id: string;
+    session_id: string;
+    workspace: string;
+    change_id: string | null;
+    work_created: string;
+    stage: string | null;
+    summary: string | null;
+    checkpoint_created: string | null;
+  },
+  state: HarnessSessionState,
+): WorkDigest {
+  const summary =
+    row.summary === null
+      ? null
+      : row.summary.length <= DIGEST_SUMMARY_MAX_CHARS
+        ? row.summary
+        : `${row.summary.slice(0, DIGEST_SUMMARY_MAX_CHARS)}… [truncated ${row.summary.length - DIGEST_SUMMARY_MAX_CHARS} chars]`;
+  return {
+    workId: row.work_id,
+    sessionId: row.session_id,
+    workspace: row.workspace,
+    changeId: row.change_id,
+    state,
+    stage: row.stage,
+    summary,
+    updatedAt: row.checkpoint_created ?? row.work_created,
+  };
+}
+
 /**
  * Escapes free text into a safe FTS5 query: each whitespace-separated token
  * becomes a quoted phrase (embedded quotes doubled), joined with implicit
@@ -827,6 +937,9 @@ function isInsideAnyGitRepo(canonicalCandidate: string): boolean {
 export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
   let db: DatabaseSync | null = null;
   let roots: string[] = [];
+  // ODD skills-enforcement-phase2: optional skills directory for the
+  // stage→skill gate. Absent means enforcement off (Phase-0 behavior).
+  const skillsGateDir = options.skillsDir;
 
   function requireOpen(): DatabaseSync {
     if (db === null) {
@@ -929,6 +1042,57 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
       );
     }
     return work;
+  }
+
+  /**
+   * ODD skills-enforcement-phase2: stage→skill gate for `checkpoint` and
+   * `stage_write`. The required skill must be loaded at its current content
+   * revision for (session, work). Unconfigured skills dir, unknown stages,
+   * and grandfathered pre-enforcement flows (a prior checkpoint for this
+   * work+stage with no load ever recorded here) stay allowed. Throws
+   * `skill-required` carrying the exact `harness_skill get` invocation.
+   */
+  function requireSkillForStage(sessionId: string, workId: string, stage: string): void {
+    if (skillsGateDir === undefined || skillsGateDir === "") {
+      return;
+    }
+    const skill = (STAGE_SKILLS as Record<string, string>)[stage];
+    if (skill === undefined) {
+      return;
+    }
+    let revision: string | null = null;
+    if (SKILL_NAME_PATTERN.test(skill)) {
+      try {
+        revision = skillRevision(readFileSync(path.join(skillsGateDir, skill, "SKILL.md"), "utf8"));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw asStoreUnavailable(error);
+        }
+      }
+    }
+    const row =
+      revision === null
+        ? null
+        : (requireOpen()
+            .prepare("SELECT revision FROM skill_loads WHERE session_id = ? AND work_id = ? AND skill_name = ?")
+            .get(sessionId, workId, skill) as { revision: string } | undefined) ?? null;
+    if (revision !== null && row !== null && row.revision === revision) {
+      return;
+    }
+    if (row === null) {
+      const prior = requireOpen()
+        .prepare("SELECT 1 FROM checkpoints WHERE work_id = ? AND completed_stage = ? LIMIT 1")
+        .get(workId, stage);
+      if (prior !== undefined) {
+        return;
+      }
+    }
+    const reason = revision === null ? "skill_not_installed" : row === null ? "not_loaded" : "skill_updated";
+    throw new HarnessStoreError(
+      "skill-required",
+      `skill-required: stage "${stage}" requires chat skill "${skill}" (${reason}). ` +
+        `Call: harness_skill { action: "get", name: "${skill}", session: "${sessionId}", work: "${workId}" }`,
+    );
   }
 
   return {
@@ -1391,6 +1555,89 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
       }
     },
 
+    findWorks(query, limit): WorkDigest[] {
+      try {
+        const like = `%${query.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+        const rows = requireOpen()
+          .prepare(
+            `SELECT ${DIGEST_COLUMNS} ${DIGEST_FROM} ` +
+              "WHERE w.change_id LIKE ? ESCAPE '\\' OR c.summary LIKE ? ESCAPE '\\' " +
+              "ORDER BY COALESCE(c.created_at, w.created_at) DESC LIMIT ?",
+          )
+          .all(like, like, clampDigestLimit(limit)) as Array<{
+          work_id: string;
+          session_id: string;
+          workspace: string;
+          change_id: string | null;
+          work_created: string;
+          stage: string | null;
+          summary: string | null;
+          checkpoint_created: string | null;
+        }>;
+        return rows.map((row) => digestOf(row, deriveSessionState(readSession(row.session_id))));
+      } catch (error) {
+        throw asStoreUnavailable(error);
+      }
+    },
+
+    recentWorks(opts): WorkDigest[] {
+      try {
+        const db = requireOpen();
+        // H4 R2-002/R3-001: the lifecycle filter applies in SQL BEFORE the
+        // limit (not in memory after it), or a filtered query returns fewer
+        // rows than requested. The CASE mirrors deriveSessionState; the 30-day
+        // bound duplicates ARCHIVED_AFTER_DAYS by design (SQL cannot call it).
+        const stateCase =
+          "CASE WHEN s.status = 'live' THEN 'live' WHEN s.ended_at IS NULL THEN 'idle' " +
+          "WHEN (julianday('now') - julianday(s.ended_at)) > 30 THEN 'archived' ELSE 'idle' END";
+        const filters: string[] = [];
+        const params: Array<string | number> = [];
+        if (opts?.workspace !== undefined) {
+          filters.push("w.workspace = ?");
+          params.push(opts.workspace);
+        }
+        if (opts?.state !== undefined) {
+          filters.push(`(${stateCase}) = ?`);
+          params.push(opts.state);
+        }
+        const rows = db
+          .prepare(
+            `SELECT ${DIGEST_COLUMNS}, ${stateCase} AS state ` +
+              `${DIGEST_FROM.replace("FROM works w", "FROM works w JOIN sessions s ON s.id = w.session_id")} ` +
+              `${filters.length > 0 ? `WHERE ${filters.join(" AND ")} ` : ""}` +
+              `ORDER BY COALESCE(checkpoint_created, work_created) DESC LIMIT ?`,
+          )
+          .all(...params, clampDigestLimit(opts?.limit)) as Array<{
+          work_id: string;
+          session_id: string;
+          workspace: string;
+          change_id: string | null;
+          work_created: string;
+          stage: string | null;
+          summary: string | null;
+          checkpoint_created: string | null;
+          state: HarnessSessionState;
+        }>;
+        return rows.map((row) =>
+          digestOf(
+            {
+              work_id: row.work_id,
+              session_id: row.session_id,
+              workspace: row.workspace,
+              change_id: row.change_id,
+              work_created: row.work_created,
+              stage: row.stage,
+              summary: row.summary,
+              checkpoint_created: row.checkpoint_created,
+            },
+            row.state,
+          ),
+        );
+      } catch (error) {
+        throw asStoreUnavailable(error);
+      }
+    },
+
     writeStageArtifact(input): StageArtifactRecord {
       try {
         requireLiveSession(input.sessionId);
@@ -1402,6 +1649,7 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
             `unknown stage: ${input.stage} (valid: ${HARNESS_STAGES.join(", ")})`,
           );
         }
+        requireSkillForStage(input.sessionId, input.workId, input.stage);
         requireWithinCap("stage body", input.body, MAX_STAGE_BODY_CHARS);
         const record: StageArtifactRecord = {
           id: randomUUID(),
@@ -1501,6 +1749,8 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
       try {
         requireLiveSession(input.sessionId);
         requireWorkInSession(input.workId, input.sessionId);
+        // ODD skills-phase3: task lists belong to the tasks stage.
+        requireSkillForStage(input.sessionId, input.workId, "tasks");
         const canonical = canonicalWorkspace(input.workspace);
         requireWithinCap("task body", input.body, MAX_TASK_BODY_CHARS);
         const record: HarnessTaskRecord = {
@@ -1619,6 +1869,7 @@ export function openHarnessStore(options: HarnessStoreOptions): HarnessStore {
             "checkpoint artifact does not belong to the presented session and work",
           );
         }
+        requireSkillForStage(input.sessionId, input.workId, input.completedStage);
         const createdAt = now();
         const result = requireOpen()
           .prepare(

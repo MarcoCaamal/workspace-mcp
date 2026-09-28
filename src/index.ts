@@ -405,6 +405,7 @@ async function main(): Promise<void> {
     const metricsStore = openHarnessStore({
       dbPath: resolved.harness.dbPath,
       workspaceRoots: workspaceConfigs.map((workspace) => workspace.path),
+      skillsDir: resolved.harness.skillsDir,
     });
     try {
       metricsStore.open();
@@ -437,6 +438,7 @@ async function main(): Promise<void> {
     const store = openHarnessStore({
       dbPath: resolved.harness.dbPath,
       workspaceRoots: workspaceConfigs.map((workspace) => workspace.path),
+      skillsDir: resolved.harness.skillsDir,
     });
     try {
       store.open();
