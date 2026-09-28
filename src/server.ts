@@ -58,6 +58,17 @@ export const HARNESS_CHAT_SKILLS: readonly ChatSkillEntry[] = [
   { name: "jira-epic", trigger: "Jira epic or large feature: overview, requirements, split into tasks" },
   { name: "cognitive-doc-design", trigger: "guides, READMEs, RFCs, onboarding, architecture, or review-facing docs" },
   { name: "issue-creation", trigger: "GitHub issues, bug reports, or feature requests" },
+  { name: "comment-writer", trigger: "PR feedback, issue replies, reviews, or human-read comments" },
+  { name: "github-pr", trigger: "creating PRs, PR descriptions, or gh CLI pull requests" },
+  { name: "chained-pr", trigger: "PRs over 400 lines, stacked PRs, review slices" },
+  { name: "sdd-explore", trigger: "exploring an idea: codebase investigation, approaches, explore stage" },
+  { name: "sdd-propose", trigger: "change proposal: intent, scope, approach, propose stage" },
+  { name: "sdd-spec", trigger: "requirements with RFC 2119 keywords and Given/When/Then, spec stage" },
+  { name: "sdd-design", trigger: "technical approach with decisions and rationale, design stage" },
+  { name: "sdd-tasks", trigger: "task breakdown with workload forecast, tasks stage" },
+  { name: "sdd-apply", trigger: "implementing tasks with tests and evidence, apply stage" },
+  { name: "sdd-verify", trigger: "requested verification diagnostics, verify stage" },
+  { name: "sdd-archive", trigger: "closing a change with its honest final state, archive stage" },
 ];
 
 export interface CreateServerOptions {

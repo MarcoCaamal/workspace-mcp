@@ -182,9 +182,27 @@ describe("chat skills catalog in instructions", () => {
     expect(text).toContain("harness_skill");
   });
 
-  it("catalog covers the batch-2 ports", () => {
+  it("catalog covers all ported skills", () => {
     const names = HARNESS_CHAT_SKILLS.map((skill) => skill.name);
-    for (const expected of ["jira-task", "jira-epic", "cognitive-doc-design", "issue-creation"]) {
+    for (const expected of [
+      "work-setup",
+      "work-unit-commits",
+      "jira-task",
+      "jira-epic",
+      "cognitive-doc-design",
+      "issue-creation",
+      "comment-writer",
+      "github-pr",
+      "chained-pr",
+      "sdd-explore",
+      "sdd-propose",
+      "sdd-spec",
+      "sdd-design",
+      "sdd-tasks",
+      "sdd-apply",
+      "sdd-verify",
+      "sdd-archive",
+    ]) {
       expect(names).toContain(expected);
     }
   });
